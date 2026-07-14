@@ -45,13 +45,18 @@
   - 默认小规模 smoke 配置。
   - 第一阶段只保留 G1 flat tracking、actor/critic 基础观测。
 
-### Smoke 数据工具
+### Smoke 与 Bones 数据工具
 
 - 新增 `gear_sonic/data_process/pack_reference_motion_to_mjlab_npz.py`：
   - 将 `gear_sonic_deploy/reference/example/<motion>/` 中的 deploy reference CSV 打包成 mjlab tracking `.npz`。
   - 支持 `--body-count` padding，用于 smoke test。
+- 新增 `gear_sonic/data_process/convert_bones_csv_to_mjlab_npz.py`：
+  - 输入单个 Bones-SEED G1 CSV。
+  - 解析 root translation/rotation 和 29 DOF。
+  - 通过 mjlab/MuJoCo forward kinematics 生成完整 body motion arrays。
+  - 输出 mjlab tracking `.npz`。
 
-注意：这个工具和生成的 padded NPZ 只是为了验证训练链路，不是最终训练数据转换方案。正式方案仍需要从 Bones-SEED CSV 经 mjlab/MuJoCo FK 生成完整 body motion。
+注意：padded NPZ 只是为了验证训练链路，不是最终训练数据；Bones CSV 转换器才是后续正式数据路径的起点。
 
 ## 已验证
 
@@ -71,7 +76,11 @@
   - `data/mjlab_smoke/bones_csv/warm_up_neck_001__A360_M.csv`
 - 基于仓库已有 deploy reference 生成过 smoke NPZ：
   - `data/mjlab_smoke/motions/macarena_001__A545_M_padded128.npz`
-- NPZ key/shape 检查通过：
+- 基于已抽样 Bones CSV 生成过 full-body FK NPZ：
+  - `data/mjlab_smoke/motions/warm_up_neck_001__A360_M_mjlab_fk_100f.npz`
+  - shape: `joint_pos (100, 29)`, `body_pos_w (100, 30, 3)`
+  - finite 检查通过。
+- padded NPZ key/shape 检查通过：
   - `joint_pos`: `(1375, 29)`
   - `joint_vel`: `(1375, 29)`
   - `body_pos_w`: `(1375, 128, 3)`
@@ -137,6 +146,21 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
 
 结果：通过，并保存 checkpoint 到 `logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260714_212506/last.pt`。
 
+正式 FK NPZ 也已通过 `num_envs=16` smoke：
+
+```bash
+conda run -n sonic python gear_sonic/train_agent_trl.py \
+  +exp=mjlab/sonic_mjlab_minimal \
+  num_envs=16 \
+  mjlab_env.motion_file=/home/wuchenghui/GR00T-WholeBodyControl/data/mjlab_smoke/motions/warm_up_neck_001__A360_M_mjlab_fk_100f.npz \
+  algo.config.num_steps_per_env=2 \
+  algo.config.num_learning_iterations=1 \
+  algo.config.num_learning_epochs=1 \
+  algo.config.num_mini_batches=1
+```
+
+结果：通过，并保存 checkpoint 到 `logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260714_222448/last.pt`。由于 rollout 只有 2 step，episode 日志 buffer 可能为空，`Mean length` 可出现 `nan`；后续应使用更长 rollout 做稳定性验证。
+
 ## 已知问题
 
 ### 1. `sonic` 环境中 joint limit buffer broadcast 差异
@@ -179,13 +203,19 @@ joint_pos_limits: (1, 29, 2)
 
 ## 下一步
 
-### P0：实现正式 Bones CSV -> mjlab NPZ 转换
+### P0：完善 Bones CSV -> mjlab NPZ 转换
 
-目标：
+已完成初版：
 
-- 输入 Bones-SEED G1 CSV。
+- 输入单个 Bones-SEED G1 CSV。
 - 输出 mjlab tracking motion NPZ。
 - body arrays 来自 MuJoCo/mjlab FK，而不是 padding。
+
+下一步：
+
+- 支持目录批量转换。
+- 增加更严格的 joint/body name 和 order 断言。
+- 对转换后的 motion 做可视化或数值 sanity。
 
 输出必须包含：
 
@@ -227,7 +257,7 @@ joint_pos_limits: (1, 29, 2)
 
 ## 当前可复现命令
 
-生成 smoke NPZ：
+生成 padded smoke NPZ：
 
 ```bash
 python gear_sonic/data_process/pack_reference_motion_to_mjlab_npz.py \
@@ -248,4 +278,18 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
   algo.config.num_learning_iterations=1 \
   algo.config.num_learning_epochs=1 \
   algo.config.num_mini_batches=1
+```
+
+
+生成 Bones full-body FK NPZ：
+
+```bash
+conda run -n sonic python gear_sonic/data_process/convert_bones_csv_to_mjlab_npz.py \
+  --input data/mjlab_smoke/bones_csv/warm_up_neck_001__A360_M.csv \
+  --output data/mjlab_smoke/motions/warm_up_neck_001__A360_M_mjlab_fk_100f.npz \
+  --input-fps 120 \
+  --output-fps 50 \
+  --device cuda:0 \
+  --max-output-frames 100 \
+  --mjlab-source-path /home/wuchenghui/mjlab/src
 ```
