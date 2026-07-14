@@ -96,6 +96,7 @@ class MjlabSonicEnvWrapper:
             self.motion_command = None
             self._motion_lib = None
 
+        self._broadcast_singleton_robot_limit_buffers()
         self._validate_minimal_tracking_contract()
         self._populate_config_dims_from_spaces()
 
@@ -139,6 +140,25 @@ class MjlabSonicEnvWrapper:
             raise ValueError(
                 f"First-stage SONIC/mjlab support expects a 29-DOF G1 body policy; got action_dim={action_dim}."
             )
+
+    def _broadcast_singleton_robot_limit_buffers(self) -> None:
+        """Work around mjlab installs that leave joint limit buffers at one env."""
+        try:
+            robot_data = self.unwrapped.scene["robot"].data
+        except Exception:
+            return
+
+        for name in (
+            "default_joint_pos_limits",
+            "joint_pos_limits",
+            "soft_joint_pos_limits",
+        ):
+            value = getattr(robot_data, name, None)
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.shape[0] == 1 and self.num_envs > 1:
+                repeat_shape = (self.num_envs,) + (1,) * (value.ndim - 1)
+                setattr(robot_data, name, value.repeat(repeat_shape))
 
     def _process_raw_obs(self, obs: dict[str, Any]) -> dict[str, torch.Tensor]:
         actor_obs = obs.get("policy", obs.get("actor"))
