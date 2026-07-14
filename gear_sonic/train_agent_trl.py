@@ -25,22 +25,6 @@ if _script_dir in sys.path:
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-try:
-    import isaaclab  # noqa: F401
-except ImportError:
-    print(
-        "\n"
-        "ERROR: Isaac Lab is required for training but not installed.\n"
-        "\n"
-        "Isaac Lab is not a pip dependency — it must be installed separately.\n"
-        "Follow the official guide:\n"
-        "  https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html\n"
-        "\n"
-        "After installing, activate the Isaac Lab conda/venv environment\n"
-        "before running this script.\n"
-    )
-    sys.exit(1)
-
 import glob
 import logging
 import os
@@ -95,6 +79,17 @@ def resume_checkpoint(config):
 
 
 def create_manager_env(config, device, args_cli):
+    try:
+        import isaaclab  # noqa: F401
+    except ImportError:
+        print(
+            "\n"
+            "ERROR: Isaac Lab is required for sim_type=isaacsim but not installed.\n"
+            "\n"
+            "Use sim_type=mjlab for the MuJoCo/mjlab path, or follow the official Isaac Lab guide:\n"
+            "  https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html\n"
+        )
+        sys.exit(1)
 
     # import wandb
 
@@ -154,8 +149,9 @@ def create_manager_env(config, device, args_cli):
 
 @hydra.main(config_path="config", config_name="base", version_base="1.1")
 def main(config: OmegaConf):
-    simulator_type = "IsaacSim"
-    env_config = config.manager_env
+    sim_type = str(config.get("sim_type", "isaacsim")).lower()
+    simulator_type = "MjLab" if sim_type in {"mjlab", "mujoco"} else "IsaacSim"
+    env_config = config.get("manager_env", None)
     from transformers import HfArgumentParser
     from trl import ModelConfig, PPOConfig, ScriptArguments
 
@@ -225,6 +221,8 @@ def main(config: OmegaConf):
 
     # Setup simulator similar to train_agent.py
 
+    args_cli = None
+    simulation_app = None
     if simulator_type == "IsaacSim":
         try:
             with open("./rl/simulator/isaacsim/.isaacsim_version", encoding="utf-8") as f:
@@ -315,10 +313,16 @@ def main(config: OmegaConf):
         print("saved meta:", meta)
 
     # Initialize environment
-    env_config.config.save_rendering_dir = str(Path(config.experiment_dir) / "renderings_training")
-    env_config.config.experiment_dir = str(Path(config.experiment_dir))
+    if simulator_type == "IsaacSim":
+        env_config.config.save_rendering_dir = str(
+            Path(config.experiment_dir) / "renderings_training"
+        )
+        env_config.config.experiment_dir = str(Path(config.experiment_dir))
+        env = create_manager_env(config, device, args_cli)
+    else:
+        from gear_sonic.envs.mjlab_env import create_mjlab_env
 
-    env = create_manager_env(config, device, args_cli)
+        env = create_mjlab_env(config, device)
     if config.get("replay", False):
         _save_video_path = config.get("replay_save_video", None)
         env.run_replay(
@@ -373,8 +377,9 @@ def main(config: OmegaConf):
                 env.config["obs"]["group_obs_names"][key] = group_obs_names
                 env.config["obs"]["obs_dims"][key] = group_obs_total_dim
                 env.config["robot"]["algo_obs_dim_dict"][key] = group_obs_total_dim
-        if config.manager_env.config.get("meta_action_dim", None) is not None:
-            env.config["robot"]["actions_dim"] = config.manager_env.config.meta_action_dim
+        manager_env_config = config.get("manager_env", {}).get("config", {})
+        if manager_env_config.get("meta_action_dim", None) is not None:
+            env.config["robot"]["actions_dim"] = manager_env_config.meta_action_dim
         else:
             env.config["robot"]["actions_dim"] = env.env.action_space.shape[-1]
 

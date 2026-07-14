@@ -1,0 +1,67 @@
+# @package _global_
+# Minimal MuJoCo/mjlab training smoke for G1 flat motion tracking.
+
+defaults:
+  - /algo: ppo_im_phc
+  - override /trainer: trl
+  - _self_
+
+sim_type: mjlab
+use_manager_env: false
+
+project_name: TRL_G1_MjLab
+experiment_name: sonic_mjlab_minimal
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+# Keep the first-stage smoke small. Increase from the command line after reset/step works.
+num_envs: 16
+headless: true
+use_wandb: false
+
+# Fill base/structure mandatory placeholders without importing Isaac configs.
+env: mjlab_g1_flat_tracking
+terrain: flat
+
+mjlab_env:
+  # Optional when using the sibling checkout at /home/wuchenghui/mjlab/src.
+  source_path: null
+  # Required: mjlab tracking .npz with joint_pos, joint_vel, body_pos_w,
+  # body_quat_w, body_lin_vel_w, body_ang_vel_w.
+  motion_file: ???
+  has_state_estimation: true
+  play: false
+  episode_length_s: 10.0
+  decimation: 4
+  physics_dt: 0.005
+  auto_reset: true
+  scale_rewards_by_dt: true
+  config:
+    robot:
+      type: g1_mjlab_29dof
+    rewards:
+      num_critics: 1
+
+callbacks:
+  model_save:
+    save_frequency: 10
+    save_last_frequency: 1
+    max_disk_usage: null
+
+algo:
+  config:
+    num_steps_per_env: 8
+    num_learning_iterations: 1
+    num_learning_epochs: 1
+    num_mini_batches: 1
+    empty_cache_every_n_ppo_epoch: -1
+    actor:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [256, 256]
+    critic:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [256, 256]
+
