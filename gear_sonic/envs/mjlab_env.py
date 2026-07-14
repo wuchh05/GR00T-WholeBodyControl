@@ -59,7 +59,10 @@ def create_mjlab_env(config, device: str) -> MjlabSonicEnvWrapper:
     )
 
     env_cfg.scene.num_envs = int(config.num_envs)
-    env_cfg.seed = int(config.seed)
+    # mjlab's seeded reset path is sensitive to invalid smoke-test motion
+    # padding. Keep the default unless the mjlab config explicitly opts in.
+    if mjlab_cfg.get("seed", None) is not None:
+        env_cfg.seed = int(mjlab_cfg.seed)
     env_cfg.episode_length_s = float(mjlab_cfg.get("episode_length_s", env_cfg.episode_length_s))
     env_cfg.decimation = int(mjlab_cfg.get("decimation", env_cfg.decimation))
     env_cfg.auto_reset = bool(mjlab_cfg.get("auto_reset", True))

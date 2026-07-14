@@ -12,6 +12,7 @@ simulator-agnostic.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -166,15 +167,30 @@ class MjlabSonicEnvWrapper:
         return self._process_raw_obs(obs)
 
     def step(self, actions):
-        if isinstance(actions, dict):
+        if isinstance(actions, Mapping) or (
+            hasattr(actions, "keys") and "actions" in actions.keys()
+        ):
             env_actions = actions["actions"]
         else:
             env_actions = actions
+        if env_actions.dim() == 1:
+            env_actions = env_actions.unsqueeze(0)
+        expected_shape = (self.num_envs, int(self.action_space.shape[-1]))
+        if tuple(env_actions.shape) != expected_shape:
+            raise ValueError(
+                f"mjlab actions must have shape {expected_shape}, got {tuple(env_actions.shape)}"
+            )
         obs, rewards, terminated, truncated, extras = self.unwrapped.step(env_actions)
         dones = (terminated | truncated).to(dtype=torch.long)
 
         infos = dict(extras or {})
         infos.setdefault("episode", infos.get("log", {}))
+        infos.setdefault("to_log", {})
+        for key, value in infos.get("log", {}).items():
+            if isinstance(value, torch.Tensor):
+                infos["to_log"][key] = value
+            else:
+                infos["to_log"][key] = torch.tensor(value, dtype=torch.float, device=self.device)
         infos["time_outs"] = truncated.to(dtype=torch.bool)
         self.extras = infos
         return self._process_raw_obs(obs), rewards, dones, infos
