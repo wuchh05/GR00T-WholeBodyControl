@@ -1,6 +1,7 @@
 """PPO trainer adapted from HuggingFace TRL for humanoid whole-body control."""
 
 import gc  # noqa: F401
+import json
 import math
 import os
 
@@ -2032,8 +2033,38 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
         output = {**logs, **{"step": self.state.global_step}}  # noqa: PIE800
         self.state.log_history.append(output)
+        self._append_local_metrics_jsonl(output)
 
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
+
+    def _append_local_metrics_jsonl(self, output: dict) -> None:
+        """Persist scalar metrics locally when wandb/tracker logging is disabled."""
+        if hasattr(self, "accelerator") and not self.accelerator.is_main_process:
+            return
+        output_dir = getattr(self.args, "output_dir", None)
+        if output_dir is None:
+            return
+        metrics_path = os.path.join(output_dir, "metrics.jsonl")
+
+        def _jsonable(value):
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    value = value.detach().cpu().item()
+                else:
+                    value = value.detach().cpu().tolist()
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            return value
+
+        try:
+            serializable = {key: _jsonable(value) for key, value in output.items()}
+            with open(metrics_path, "a", encoding="utf-8") as file:
+                file.write(json.dumps(serializable, sort_keys=True) + "\n")
+        except Exception:
+            # Metrics logging should never affect training.
+            pass
 
     def _gradient_clipping(self):
         """Clip gradients and detect NaN/Inf, skipping the update if found.

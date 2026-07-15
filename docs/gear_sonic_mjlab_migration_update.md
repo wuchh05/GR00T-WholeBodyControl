@@ -111,13 +111,19 @@ conda run -n sonic python gear_sonic/data_process/filter_and_copy_bones_data.py 
 - 0 字节 CSV 数：`0`。
 - 因此 G1 CSV 下载和解压可以判定为完整。
 
-全量官方 Step1/Step2 已放入 detached tmux session：`bones_full_processing`。日志文件形如：
+全量官方 Step1/Step2 已完成。日志文件：
 
 ```bash
 logs/data_processing/full_bones_processing_20260715_203300.log
 ```
 
-截至 2026-07-15 21:10 左右，官方 Step1 已产出 `142220` 个 PKL；tmux session 仍在运行，后续会继续执行 Step2 filter 到 `data/motion_lib_bones_seed/robot_filtered`。局部验证目录已用当前已解压 CSV 跑通官方 Step1/Step2。
+最终结果：
+
+- 官方 Step1 输出：`data/motion_lib_bones_seed/robot`，`142220` 个 PKL。
+- 官方 Step2 输出：`data/motion_lib_bones_seed/robot_filtered`，`129785` 个 PKL。
+- `bones_full_processing` tmux session 已结束。
+
+局部验证目录和全量目录都已跑通官方 Step1/Step2。
 
 ## 已验证
 
@@ -485,6 +491,69 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
 
 这说明 training guide 官方配置的依赖阻塞已解除；但这仍只是 tiny smoke，不是官方收敛复现。
 
+
+### 官方 `sonic_release` reload / eval / mjlab universal-token smoke
+
+已完成完整 release 网络的第一轮 smoke 验证：
+
+- `sonic_release/last.pt` reload smoke 已通过：日志显示 `Loaded checkpoint from step 41550`，进入 `Learning iteration 1`，无 key mismatch / size mismatch / RuntimeError。
+  - 日志：`logs/data_processing/sonic_release_reload_smoke_128.log`
+- `eval_agent_trl.py` metrics smoke 已通过，并显式落盘 metrics JSON。
+  - 输出：`logs_eval/sonic_release_metrics_smoke/metrics_eval.json`
+  - 结果：`motion_count=4`，包含 `eval/all_metrics_dict`、`mpjpe_l`、`mpjpe_g`、`accel_dist` 等字段。
+  - 日志：`logs/data_processing/sonic_release_eval_metrics_smoke_with_json.log`
+- mjlab universal-token finetune smoke 已通过。
+  - 配置：`gear_sonic/config/exp/mjlab/sonic_mjlab_universal_smoke.yaml`
+  - checkpoint：`sonic_release/last.pt`
+  - 数据：`data/mjlab_compare/bones_128_npz_100f`，`max_motions=8`
+  - 规模：`num_envs=4`、`num_steps_per_env=4`、`num_learning_iterations=1`
+  - 网络：`UniversalTokenModule`、FSQ、G1/teleop/SMPL encoders、`g1_dyn` action decoder、`g1_kin` motion decoder 均初始化成功。
+  - 当前 v1 语义：G1 tokenizer 使用真实 future motion；teleop/SMPL tokenizer 字段为 checkpoint-compatible 占位；aux loss 仅启用 `g1_recon`。
+  - 输出：`logs_rl/TRL_G1_MjLab/sonic_mjlab_universal_smoke-20260715_225918/last.pt`
+  - 本地训练记录：`logs_rl/TRL_G1_MjLab/sonic_mjlab_universal_smoke-20260715_225918/metrics.jsonl`
+  - 记录字段包括 `loss/policy_avg`、`loss/value_avg`、`loss/entropy_avg`、`loss/aux_g1_recon_avg`、`loss/total_aux_loss_avg`。
+
+### Isaac-vs-mjlab 128 motion 完整网络小训练对比
+
+已完成 128 条 motion、同预算、完整 release 网络结构的小训练对比。该对比的目的不是宣称 mjlab 已和 Isaac 完全等价，而是验证完整网络能在两边加载、rollout、backward、保存，并暴露下一步语义差异。
+
+- Isaac：`+exp=manager/universal_token/all_modes/sonic_release`，checkpoint 使用 `sonic_release/last.pt`，motion 使用 `data/mjlab_compare/bones_128_motion_lib_robot_filtered`。
+- mjlab：`+exp=mjlab/sonic_mjlab_universal_smoke`，checkpoint 使用 `sonic_release/last.pt`，motion 使用 `data/mjlab_compare/bones_128_npz_100f`。
+- 预算：`num_envs=16`、`num_steps_per_env=8`、`num_learning_iterations=10`、`num_learning_epochs=1`、`num_mini_batches=1`。
+
+| backend | run dir | records | checkpoint | key observation |
+| --- | --- | ---: | --- | --- |
+| Isaac full-network | `logs_rl/TRL_G1_Track/manager/universal_token/all_modes/sonic_release_isaac_full_128_16x8x10-20260715_230143` | 10 | `last.pt` | 10 iterations 完成，loss finite，termination 计数为 0 |
+| mjlab full-network v1 | `logs_rl/TRL_G1_MjLab/sonic_mjlab_universal_smoke_mjlab_full_128_16x8x10-20260715_230631` | 10 | `last.pt`, `model_step_000010.pt` | 10 iterations 完成，loss finite，但 value/weighted PPO loss 更高，`ee_body_pos` termination 较多 |
+
+关键指标摘要：
+
+| backend | step | policy loss | value loss | entropy | aux g1 recon | total aux | motion/body or termination signal |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Isaac | 1 | `0.00277` | `0.05317` | `13.12242` | `0.33074` | `0.01139` | `anchor_pos=0`, `ee_body_pos=0` |
+| Isaac | 10 | `0.02734` | `0.00477` | `13.12160` | `0.41616` | `0.02054` | `anchor_pos=0`, `ee_body_pos=0` |
+| mjlab | 1 | `-0.01246` | `0.29966` | `13.12242` | `0.52253` | `0.00523` | `error_body_pos=0.09350`, `ee_body_pos=2.66667` |
+| mjlab | 10 | `0.06141` | `2.30206` | `13.12333` | `0.50630` | `0.00506` | `error_body_pos=0.17854`, `ee_body_pos=1.57143` |
+
+汇总 JSON：`logs/data_processing/full_network_compare_128_16x8x10.json`。
+
+结论：完整网络训练链路已能在 mjlab 上跑通，但数值趋势还不能视为和 Isaac 等价。当前 mjlab v1 的差异主要来自：critic privileged obs 仍是 padding 兼容、teleop/SMPL tokenizer 为占位、reward/termination 语义与 Isaac 尚未完全对齐。
+
+### 完整网络 eval 对比 smoke
+
+- Isaac finetuned checkpoint eval 已通过：
+  - checkpoint：`logs_rl/TRL_G1_Track/manager/universal_token/all_modes/sonic_release_isaac_full_128_16x8x10-20260715_230143/last.pt`
+  - 输出：`logs_eval/isaac_full_128_16x8x10_metrics/metrics_eval.json`
+  - `motion_count=4`
+  - `eval/all/mpjpe_l=28.46325`，`eval/all/mpjpe_g=589.28462`，`eval/all/accel_dist=1.40326`
+- mjlab finetuned checkpoint eval plumbing 已通过：
+  - checkpoint：`logs_rl/TRL_G1_MjLab/sonic_mjlab_universal_smoke_mjlab_full_128_16x8x10-20260715_230631/last.pt`
+  - 输出：`logs_eval/mjlab_full_128_16x8x10_metrics.json`
+  - `steps=32`，`num_envs=16`，`reward_finite=true`，`done_count=48`
+  - tracking metrics mean：anchor pos `0.07692`，body pos `0.13079`，joint pos `2.60516`
+
+这两套 eval 口径目前还不是同一指标空间：Isaac 是官方 MPJPE/accel callback；mjlab 是 MotionCommand tracking metrics。后续要把 mjlab eval 输出进一步对齐 official eval callback 的 metric schema。
+
 ## 已解决问题
 
 ### 1. `sonic` 环境中 joint limit buffer broadcast 差异
@@ -566,6 +635,31 @@ joint_pos_limits: (1, 29, 2)
 
 验证：4 条 NPZ smoke 通过；128 条 NPZ、64 env x 8 step x 10 iterations 训练通过。
 
+
+### 9. 官方 `sonic_release` checkpoint reload 和 eval smoke
+
+现象：此前只完成了 tiny train smoke，未确认 release checkpoint 能完整加载，也未确认官方 eval callback 能落盘 metrics。
+
+处理：使用 `sonic_release/last.pt`、128 motion 子集和 `data/smpl_filtered` 分别跑 checkpoint reload smoke 与 `eval_agent_trl.py` metrics smoke。
+
+验证：checkpoint reload 显示 `Loaded checkpoint from step 41550`；eval 输出 `logs_eval/sonic_release_metrics_smoke/metrics_eval.json`，包含 `eval/all_metrics_dict`。
+
+### 10. mjlab universal-token 完整网络 smoke
+
+现象：mjlab 之前只验证了 minimal MLP，不能说明官方 universal-token 网络、FSQ、encoder/decoder 和 PPO backward 能在 mjlab wrapper 上运行。
+
+处理：新增 mjlab universal-token smoke 配置和 G1-only aux loss 配置；wrapper 增加 checkpoint-compatible tokenizer schema 和 actor/critic dim 兼容。
+
+验证：`sonic_mjlab_universal_smoke-20260715_225918` 完成 1 iteration，保存 `last.pt`，生成 `metrics.jsonl`，包含 PPO loss 和 `loss/aux_g1_recon_avg`。
+
+### 11. 无 wandb 时缺少本地 loss 记录
+
+现象：`use_wandb=false` 时 stdout 只显示 pretty training table，PPO/aux loss 没有稳定落盘。
+
+处理：在 `TRLPPOTrainer.log()` 中追加本地 `metrics.jsonl` 写入，不依赖 wandb/API。
+
+验证：mjlab universal-token smoke 和 Isaac/mjlab full-network 128 motion 对比均生成 `metrics.jsonl`，包含 `loss/policy_avg`、`loss/value_avg`、`loss/entropy_avg`、`loss/aux_g1_recon_avg`、`loss/total_aux_loss_avg`。
+
 ## 已知问题
 
 ### 1. seed 逻辑暂时保守
@@ -574,64 +668,39 @@ joint_pos_limits: (1, 29, 2)
 
 等多环境和正式 motion 转换稳定后，需要重新恢复和验证可复现 seed。
 
-### 2. 官方 `sonic_release` 仍未做长训/效果复现
+### 2. mjlab full-network v1 仍未和 Isaac 语义等价
 
-`vector_quantize_pytorch` 已补齐，`open3d` 也已改为可选依赖；官方 `sonic_release` tiny smoke 已能初始化 universal-token/FSQ/encoders/decoders 并进入 PPO iteration。当前仍未完成的是长训收敛、checkpoint finetune/reload、官方 eval 指标复现。128 motion 对比仍是 minimal MLP，不是官方全量 SONIC。
+完整网络已经能在 mjlab 上加载、训练、保存和 eval plumbing，但当前 v1 仍有三类语义差异：critic privileged obs 仍是 padding 兼容，teleop/SMPL tokenizer 字段仍是占位，reward/termination/eval metric 口径尚未完全对齐 Isaac。128 motion full-network 小训练中，mjlab 的 value/weighted PPO loss 明显高于 Isaac，且 `ee_body_pos` termination 较多。
 
 ## 下一步
 
-### P0：扩大姿态覆盖并解释剩余姿态误差
+### P0：修正 mjlab full-network 语义差异
 
-已完成 4 条局部 motion x 3 frame 的 FK 扫描。下一步应覆盖更大动作幅度，并把姿态误差分解到具体 body frame：
+当前主线已经从“能否跑通”转为“是否和 Isaac Lab 训练行为一致”。下一步优先修正完整网络 v1 的已知差异：
 
-- 从已解压 CSV 中抽 50-100 条，优先包含手臂、腰、脚踝大幅动作。
-- 批量转换 mjlab NPZ，并跑 FK batch。
-- 对姿态误差超过阈值的 body，比较 URDF joint origin/rpy 与 MJCF body quat/pos，判断是否是固定 frame 定义差异。
+- 把 mjlab `critic_obs` 从 padding 兼容改成等价 `privileged_mf_hist`，覆盖 command、anchor、body pos/ori、base vel、joint pos/vel、actions history。
+- 把 teleop/SMPL tokenizer 占位替换为真实数据源；在这之前，禁止把当前 v1 的 full-network 结果解释为官方 SONIC 等价训练。
+- 在 G1 tokenizer 里补齐 anchor orientation、root height、future frame dt 语义，而不只做 shape-compatible。
+- 重新启用官方全量 aux loss：`g1_smpl_latent`、`g1_teleop_latent`、`teleop_smpl_latent`、`reencoded_smpl_g1_latent`，并观察 `metrics.jsonl` 中各项 loss 是否 finite。
 
-### P1：官方 `sonic_release` checkpoint reload / eval smoke
+### P1：过程级 Isaac-vs-mjlab 对齐
 
-官方 `sonic_release` tiny train smoke 已完成。下一步应验证 release checkpoint 和官方 eval plumbing：
+- 对同一批 100+ motion 抽样，逐项对比 Isaac 和 mjlab 的 obs shape、tokenizer slice、action dim、reward term、termination term。
+- 对 `ee_body_pos` termination 较高的 mjlab episodes，记录 motion key、frame、anchor/body/joint error，定位是 motion conversion、body order、reward scale 还是 termination 阈值差异。
+- 扩大 FK/body pose 检查，覆盖手臂、腰、脚踝大幅动作，并把姿态误差分解到具体 body frame。
 
-- 使用 `+checkpoint=sonic_release/last.pt` 做 finetune/reload smoke。
-- `num_envs=16/64`、短 rollout、1-2 iterations。
-- 跑 `eval_agent_trl.py` 的 metrics mode 小规模 smoke。
-- 确认 tokenizer obs、universal-token actor、aux losses、SMPL motion path、checkpoint key 都能加载。
-- 通过后再考虑把 mjlab wrapper 逐步扩展到 tokenizer/universal-token 所需 observation/action 语义。
+### P2：扩大 full-network 训练对比
 
-### P2：扩大局部数据和训练验证
+- 先保持 128 motion，跑 `num_envs=64`、`num_steps_per_env=24`、`num_learning_iterations=50-100`。
+- 每次只改一个语义模块，跑 smoke + 10 iteration + 50 iteration，避免越改越偏。
+- 对比 `metrics.jsonl`：reward、episode length、done count、policy loss、value loss、entropy、aux loss。
+- Isaac 侧继续用 `eval_agent_trl.py` 产出 `metrics_eval.json`；mjlab 侧逐步把 eval plumbing 对齐到相同 metric schema。
 
-已完成：
+### P3：文档和命令固化
 
-- 局部 32 CSV 官方 Step1/Step2。
-- 局部 4 条 mjlab full-body NPZ。
-- `num_envs=64`、10 iterations 单 motion 小训练趋势。
-
-下一档目标：
-
-- 转换 50-100 条局部 mjlab NPZ。
-- 支持多 motion 采样或先逐条跑 smoke。
-- checkpoint reload 后继续 rollout。
-- 比较不同 motion 的 reward/error/termination 分布，确认不是只在单条 idle motion 上可跑。
-
-### P3：实现 mjlab eval 指标
-
-对齐官方 training guide 的 eval 口径：
-
-- success rate。
-- local/global MPJPE。
-- render video。
-
-初期不要求达到官方收敛指标，但要能稳定计算并用于 Isaac-vs-mjlab 横向比较。
-
-### P4：逐步恢复 SONIC 特性
-
-在基础 PPO/mjlab 链路和正确性验证稳定后，再逐步加入：
-
-- multi-future command observations。
-- tokenizer observation group。
-- universal-token actor / aux loss。
-- adaptive sampling。
-- hand/object/camera/VLA 相关能力。
+- 把 full-network smoke、128 motion 对比、eval JSON 路径整理成固定命令块。
+- 为 mjlab v1 明确标注“G1 tokenizer 真实，teleop/SMPL 占位”的限制。
+- 后续只有当 critic/tokenizer/reward/eval 全部对齐后，才进入长训和官方效果复现阶段。
 
 ## 当前可复现命令
 

@@ -1,0 +1,110 @@
+# @package _global_
+# MuJoCo/mjlab universal-token smoke for G1 flat tracking.
+
+defaults:
+  - /algo: ppo_im_phc
+  - /aux_losses: universal_token/g1_recon_only
+  - override /trainer: trl_ppo_aux
+  - override /actor_critic: universal_token/all_mlp_v1
+  - _self_
+
+sim_type: mjlab
+use_manager_env: false
+
+project_name: TRL_G1_MjLab
+experiment_name: sonic_mjlab_universal_smoke
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 8
+headless: true
+use_wandb: false
+
+env: mjlab_g1_flat_tracking
+terrain: flat
+
+actor_prop_history_length: 10
+actor_actions_history_length: 10
+critic_prop_history_length: 10
+critic_actions_history_length: 10
+
+manager_env:
+  config:
+    robot:
+      type: g1_model_12_dex
+  commands:
+    motion:
+      num_future_frames: 10
+      dt_future_ref_frames: 0.1
+      smpl_num_future_frames: 10
+      smpl_dt_future_ref_frames: 0.02
+      encoder_sample_probs:
+        g1: 1.0
+        teleop: 1.0
+        smpl: 1.0
+
+mjlab_env:
+  source_path: null
+  motion_file: null
+  motion_files: null
+  motion_dir: null
+  motion_glob: "**/*.npz"
+  max_motions: null
+  has_state_estimation: true
+  play: false
+  episode_length_s: 10.0
+  decimation: 4
+  physics_dt: 0.005
+  auto_reset: true
+  scale_rewards_by_dt: true
+  config:
+    universal_token: true
+    actor_history_length: ${actor_prop_history_length}
+    critic_history_length: ${critic_prop_history_length}
+    num_future_frames: ${manager_env.commands.motion.num_future_frames}
+    smpl_num_future_frames: ${manager_env.commands.motion.smpl_num_future_frames}
+    robot:
+      type: g1_mjlab_29dof
+    rewards:
+      num_critics: 1
+
+callbacks:
+  model_save:
+    save_frequency: 10
+    save_last_frequency: 1
+    max_disk_usage: null
+
+algo:
+  config:
+    num_steps_per_env: 4
+    num_learning_iterations: 1
+    num_learning_epochs: 1
+    num_mini_batches: 1
+    empty_cache_every_n_ppo_epoch: -1
+    use_clampped_std: true
+    std_clamp_min: 0.001
+    std_clamp_max: 0.5
+    max_grad_norm: 0.1
+    actor:
+      backbone:
+        reencode_smpl_g1_recon: false
+        encoders:
+          g1:
+            inputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
+          teleop:
+            inputs:
+              [
+                "command_multi_future_lower_body",
+                "vr_3point_local_target",
+                "vr_3point_local_orn_target",
+                "motion_anchor_ori_b",
+              ]
+          smpl:
+            inputs:
+              [
+                "smpl_joints_multi_future_local_nonflat",
+                "smpl_root_ori_b_multi_future",
+                "joint_pos_multi_future_wrist_for_smpl",
+              ]
+        decoders:
+          g1_kin:
+            outputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
