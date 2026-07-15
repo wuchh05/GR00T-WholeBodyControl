@@ -304,17 +304,23 @@ def process_ep_infos(ep_infos, device):
         Dict mapping each metric name to its mean value across all episodes.
     """
     infos = {}
-    for key in ep_infos[0]:
+    keys = sorted({key for ep_info in ep_infos for key in ep_info})
+    for key in keys:
         infotensor = torch.tensor([], device=device)
         for ep_info in ep_infos:
+            if key not in ep_info:
+                continue
+            value = ep_info[key]
             # handle scalar and zero dimensional tensor infos
-            if not isinstance(ep_info[key], torch.Tensor):
-                ep_info[key] = torch.Tensor([ep_info[key]])
-            if len(ep_info[key].shape) == 0:
-                ep_info[key] = ep_info[key].unsqueeze(0)
-            infotensor = torch.cat((infotensor, ep_info[key].to(device)))
-        value = torch.mean(infotensor)
-        infos[key] = value
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor([value], device=device)
+            else:
+                value = value.to(device)
+            if len(value.shape) == 0:
+                value = value.unsqueeze(0)
+            infotensor = torch.cat((infotensor, value))
+        if infotensor.numel() > 0:
+            infos[key] = torch.mean(infotensor)
     return infos
 
 
