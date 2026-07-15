@@ -15,7 +15,10 @@ import numpy as np
 from omegaconf import DictConfig
 
 # import logging
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:  # Optional mesh visualization dependency.
+    o3d = None
 from rich.progress import track
 import scipy.ndimage.filters as filters
 from scipy.spatial.transform import Rotation as sRot
@@ -752,6 +755,13 @@ class Humanoid_Batch:
         return angular_velocity
 
     def load_mesh(self):
+        if o3d is None:
+            self.geom_transform = {}
+            self.mesh_dict = {}
+            self.body_to_mesh = defaultdict(set)
+            self.mesh_to_body = {}
+            return
+
         xml_base = os.path.dirname(self.mjcf_file)
         # Read the compiler tag from the g1.xml file to find if there is a meshdir defined
         tree = ETree.parse(self.mjcf_file)
@@ -827,6 +837,8 @@ class Humanoid_Batch:
         """
         Load the mesh from the XML file and merge them into the humanoid based on the current pose.
         """
+        if o3d is None:
+            raise ImportError("open3d is required for mesh_fk(), but it is not installed.")
         if pose is None:
             fk_res = self.fk_batch(
                 torch.zeros(1, 1, len(self.body_names_augment), 3), torch.zeros(1, 1, 3)

@@ -1,0 +1,62 @@
+# @package _global_
+# Minimal Isaac Lab training smoke for paired comparison with mjlab minimal.
+
+defaults:
+  - /algo: ppo_im_phc
+  - /manager_env: base_env
+  - override /trainer: trl
+  - _self_
+
+sim_type: isaacsim
+use_manager_env: true
+
+project_name: TRL_G1_Isaac_Minimal
+experiment_name: sonic_isaac_minimal
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 16
+headless: true
+use_wandb: false
+
+actor_prop_history_length: 1
+actor_actions_history_length: 1
+critic_prop_history_length: 1
+critic_actions_history_length: 1
+
+manager_env:
+  config:
+    robot:
+      type: g1_model_12_dex
+    terrain_type: plane
+    env_spacing: 2.0
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: ???
+        smpl_motion_file:
+        adaptive_sampling:
+          enable: false
+
+callbacks:
+  model_save:
+    save_frequency: 1
+    save_last_frequency: 1
+    max_disk_usage: null
+
+algo:
+  config:
+    num_steps_per_env: 4
+    num_learning_iterations: 1
+    num_learning_epochs: 1
+    num_mini_batches: 1
+    empty_cache_every_n_ppo_epoch: -1
+    actor:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [256, 256]
+    critic:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [256, 256]

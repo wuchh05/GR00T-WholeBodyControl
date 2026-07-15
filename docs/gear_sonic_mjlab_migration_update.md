@@ -44,9 +44,16 @@
   - `sim_type: mjlab`
   - 默认小规模 smoke 配置。
   - 第一阶段只保留 G1 flat tracking、actor/critic 基础观测。
+- 新增 `gear_sonic/config/exp/manager/sonic_isaac_minimal.yaml`：
+  - 用 Isaac Lab 原环境跑一个和 mjlab minimal 尽量接近的 MLP PPO 基线。
+  - actor obs `160`、critic obs `286`、action `29`，便于和 mjlab minimal 做小数据训练趋势对比。
+  - 这不是官方 `sonic_release` universal-token 全量配置，只用于低成本横向 smoke。
 
 ### Smoke 与 Bones 数据工具
 
+- 新增 `gear_sonic/scripts/summarize_training_compare.py`：
+  - 从 Isaac/mjlab 训练日志中提取 iteration 和 Mean rewards。
+  - 输出 JSON，便于后续 50-100 条 motion 的训练对比复用同一套汇总口径。
 - 新增 `gear_sonic/data_process/pack_reference_motion_to_mjlab_npz.py`：
   - 将 `gear_sonic_deploy/reference/example/<motion>/` 中的 deploy reference CSV 打包成 mjlab tracking `.npz`。
   - 支持 `--body-count` padding，用于 smoke test。
@@ -373,6 +380,36 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
 - reward/metrics/loss 未出现 NaN；mean rewards 从约 `0.61` 增至约 `1.94`。
 - 仍可见短 rollout 初期 `Mean length: nan` / empty-slice warning，这是 episode buffer 初期为空导致的日志问题，不阻断训练。
 
+
+### Isaac-vs-mjlab 小训练对比
+
+已完成一组单 motion、同预算、低成本 paired comparison。为了避免官方 universal-token 配置的额外依赖和特性混入，这里使用两个 minimal MLP 配置：
+
+- Isaac: `gear_sonic/config/exp/manager/sonic_isaac_minimal.yaml`，motion 使用官方 Step1/Step2 生成的 PKL。
+- mjlab: `gear_sonic/config/exp/mjlab/sonic_mjlab_minimal.yaml`，motion 使用同一个 Bones CSV 转成的 mjlab NPZ。
+- motion: `220714/change_idle_left_to_idle_001__A025`。
+- 预算：`num_envs=64`、`num_steps_per_env=8`、`num_learning_iterations=10`、`num_learning_epochs=1`、`num_mini_batches=1`。
+
+运行结果：
+
+| backend | log dir | Mean rewards trend | final Mean rewards |
+| --- | --- | --- | --- |
+| Isaac minimal | `logs_rl/TRL_G1_Isaac_Minimal/sonic_isaac_minimal-20260715_195714` | `0.00000 -> 1.78443` | `1.78443` |
+| mjlab minimal | `logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260715_195923` | `0.00000 -> 1.93785` | `1.93785` |
+
+汇总 JSON：`logs/data_processing/minimal_training_compare_64x8x10.json`。解析命令：
+
+```bash
+python gear_sonic/scripts/summarize_training_compare.py \
+  --isaac-log logs/data_processing/isaac_minimal_compare_64x8x10.log \
+  --mjlab-log logs/data_processing/mjlab_minimal_compare_64x8x10.log \
+  --output-json logs/data_processing/minimal_training_compare_64x8x10.json
+```
+
+结论：两边在同一条 partial Bones motion 上都能完成训练，obs/action 维度一致，reward 均呈正向趋势，且没有 NaN/崩溃。这能证明 mjlab pipeline 不是只会跑空 rollout，而是能进入可学习闭环。它还不能证明和 Isaac 官方训练最终效果等价，因为当前只用了单 motion、10 iterations、minimal MLP 子集，且两边 reward/termination 实现仍有细节差异。
+
+官方 `sonic_release` 全量配置的 Isaac 对比暂未完成：首次尝试时暴露了 `open3d` 和 `vector_quantize_pytorch` 依赖问题。`open3d` 已改为可选依赖；`vector_quantize_pytorch` 仍需要安装或替换后才能跑 universal-token 路径。
+
 ## 已解决问题
 
 ### 1. `sonic` 环境中 joint limit buffer broadcast 差异
@@ -422,6 +459,22 @@ joint_pos_limits: (1, 29, 2)
 
 验证：同一 frame 重跑后通过，最大位置误差 `0.01097 m`，最大姿态误差 `0.22117 rad`。批量 4 motion x 3 frame 扫描的最大位置误差为 `0.02153 m`，没有出现大尺度错位。
 
+### 5. 官方 Isaac minimal 对比路径缺少 `open3d`
+
+现象：尝试跑 Isaac 侧 minimal/official 路径时，`torch_humanoid_batch.py` 顶层 import `open3d`，但当前 `sonic` 环境未安装该包。该训练路径不需要 mesh FK，因此不应阻断。
+
+处理：把 `open3d` 改为可选依赖；只有调用 `mesh_fk()` 时才要求安装 `open3d`。
+
+验证：Isaac minimal 训练已能继续越过该 import，并完成 64 env x 8 step x 10 iterations 的对比训练。
+
+### 6. Isaac-vs-mjlab 小训练对比已完成第一版
+
+现象：此前只有 mjlab 单边训练趋势，无法回答“和 Isaac 原环境相比是不是至少同方向可学”。
+
+处理：新增 Isaac minimal 配置，使用同一条 partial Bones motion 的官方 PKL，与对应 mjlab NPZ 做同预算 10-iteration 对比。
+
+验证：Isaac Mean rewards `0.00000 -> 1.78443`，mjlab Mean rewards `0.00000 -> 1.93785`；两边都正向、无 NaN、保存 checkpoint。
+
 ## 已知问题
 
 ### 1. seed 逻辑暂时保守
@@ -432,7 +485,11 @@ joint_pos_limits: (1, 29, 2)
 
 ### 2. mjlab 当前只接单个 NPZ motion file
 
-`mjlab.tasks.tracking.mdp.MotionLoader` 当前通过 `np.load(motion_file)` 读取单个 NPZ。局部小训练趋势使用单条 motion；后续如果要多 motion 采样，需要扩展 loader 或在外层合并/采样 motion。
+`mjlab.tasks.tracking.mdp.MotionLoader` 当前通过 `np.load(motion_file)` 读取单个 NPZ。局部小训练趋势和 Isaac-vs-mjlab 第一版训练对比都使用单条 motion；后续如果要多 motion 采样，需要扩展 loader 或在外层合并/采样 motion。
+
+### 3. 官方 `sonic_release` universal-token 对比仍缺依赖
+
+官方 release 配置会走 universal-token/quantizer 路径，当前 `sonic` 环境缺少 `vector_quantize_pytorch`。因此本轮对比使用 minimal MLP 配置，不是官方全量 SONIC 配置。要做 official-vs-mjlab 复现对比，需要先补齐该依赖并确认 checkpoint/config 能加载。
 
 ## 下一步
 
@@ -444,14 +501,15 @@ joint_pos_limits: (1, 29, 2)
 - 批量转换 mjlab NPZ，并跑 FK batch。
 - 对姿态误差超过阈值的 body，比较 URDF joint origin/rpy 与 MJCF body quat/pos，判断是否是固定 frame 定义差异。
 
-### P1：Isaac 原版 vs mjlab 小数据训练对比
+### P1：扩大 Isaac-vs-mjlab 训练对比
 
-可以做，但建议放在 FK/rollout/eval plumbing 之后：
+第一版单 motion minimal 对比已完成。下一步应把它从“能学”推进到“统计上更可信”：
 
-- 使用同一批 16-64 条 motion。
-- Isaac 走官方 motion_lib PKL，mjlab 走对应 NPZ。
-- 使用尽量接近的 obs/reward/termination 子集和相同训练预算。
-- 比较 reward trend、termination reason、anchor/body error，而不是期待早期曲线逐点一致。
+- 抽 16-64 条 partial/full Bones motion。
+- Isaac 使用官方 motion_lib PKL；mjlab 使用对应 NPZ。
+- mjlab 需要先支持多 motion 采样，或者先写外层 runner 逐条跑固定预算并汇总。
+- 对比 reward trend、termination reason、anchor/body error、checkpoint reload/eval plumbing，而不是期待早期曲线逐点一致。
+- official `sonic_release` 对比要先补齐 `vector_quantize_pytorch`，再逐步打开 tokenizer/universal-token/aux loss。
 
 ### P2：扩大局部数据和训练验证
 
