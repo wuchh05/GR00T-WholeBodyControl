@@ -224,6 +224,35 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
 
 结果：通过，并保存 checkpoint 到 `logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260714_222448/last.pt`。由于 rollout 只有 2 step，episode 日志 buffer 可能为空，`Mean length` 可出现 `nan`；后续应使用更长 rollout 做稳定性验证。
 
+### Isaac-vs-mjlab 单帧 FK 对齐
+
+FK 是 forward kinematics，即给定 root 位姿和 29 DOF 关节角后，直接计算各个 body/link 的世界坐标和姿态。这个检查不涉及 policy、reward 或训练，只验证同一帧动作在 Isaac G1 和 mjlab/MuJoCo G1 上的几何结果是否一致。
+
+新增 `gear_sonic/scripts/check_isaac_mjlab_fk_alignment.py`，已用局部 Bones partial 数据验证：
+
+```bash
+conda run -n sonic python gear_sonic/scripts/check_isaac_mjlab_fk_alignment.py \
+  --bones-csv data/partial_bones_seed/g1_csv/220714/change_idle_left_to_idle_001__A025.csv \
+  --mjlab-npz data/partial_bones_seed/mjlab_motions_100f/220714/change_idle_left_to_idle_001__A025.npz \
+  --frame 0 \
+  --device cpu \
+  --headless \
+  --output-json logs/data_processing/isaac_mjlab_fk_frame0.json
+```
+
+结果：
+
+- 14 个 tracking body 全部按 body name 对齐。
+- 最大位置误差：`0.01097 m`。
+- 平均位置误差：`0.00461 m`。
+- 最大姿态误差：`0.22117 rad`。
+- 平均姿态误差：`0.10250 rad`。
+- 状态：`pass`，低于当前临时阈值 `0.05 m` / `0.25 rad`。
+
+第一次运行时曾出现约 `1 m` 级误差，原因不是引擎差异，而是检查脚本误用了 body mapping 方向。修正为按 mjlab 实际 body name 顺序索引后，对齐通过。
+
+注意：GPU Isaac/PhysX 运行曾因当前机器显存分配失败而无法创建 PhysicsScene；CPU headless 模式可完成该单帧检查。
+
 ### 短 rollout sanity
 
 新增 `gear_sonic/scripts/check_mjlab_rollout_sanity.py`，已在局部 Bones/mjlab NPZ 上验证：
@@ -307,34 +336,35 @@ joint_pos_limits: (1, 29, 2)
 
 验证：修复后同一命令跑满 10 iterations 并保存 checkpoint。
 
+### 4. Isaac-vs-mjlab FK 检查脚本 body mapping 方向错误
+
+现象：首次 Isaac-vs-mjlab FK 对齐出现约 `1 m` 级位置误差，但 pelvis 和部分末端 body 又接近正常，提示更像是检查脚本的 body index 取错，而不是整体坐标系错误。
+
+处理：改为按 mjlab 实际 `robot.body_names` 顺序索引 NPZ 中的 body arrays，避免使用方向容易混淆的 body mapping 常量。
+
+验证：同一 frame 重跑后通过，最大位置误差 `0.01097 m`，最大姿态误差 `0.22117 rad`。
+
 ## 已知问题
 
-### 1. Isaac-vs-mjlab 单帧 FK 对齐尚未完成
-
-当前已经完成 mjlab 内部的 joint/body/order/NPZ shape 检查，但还没有在 Isaac Lab 中对同一 Bones frame 做 forward kinematics 并与 mjlab body pose 数值对比。
-
-这是判断 Isaac 训练效果能否迁移到 mjlab 的关键验证项之一。
-
-### 2. seed 逻辑暂时保守
+### 1. seed 逻辑暂时保守
 
 `create_mjlab_env()` 当前只有显式设置 `mjlab_env.seed` 时才传给 mjlab。原因是 smoke 阶段先避免额外触发 reset/randomization 分支。
 
 等多环境和正式 motion 转换稳定后，需要重新恢复和验证可复现 seed。
 
-### 3. mjlab 当前只接单个 NPZ motion file
+### 2. mjlab 当前只接单个 NPZ motion file
 
 `mjlab.tasks.tracking.mdp.MotionLoader` 当前通过 `np.load(motion_file)` 读取单个 NPZ。局部小训练趋势使用单条 motion；后续如果要多 motion 采样，需要扩展 loader 或在外层合并/采样 motion。
 
 ## 下一步
 
-### P0：完成 Isaac-vs-mjlab 单帧 FK 对齐
+### P0：把单帧 FK 扩展成多帧/多 motion 扫描
 
-当前已完成 mjlab 内部顺序检查，但还需要在 Isaac Lab 可运行环境下做同一帧对比：
+单帧 FK 已通过，但还需要覆盖更多姿态，避免只在 idle/小动作上成立：
 
-- 输入同一 Bones CSV frame 的 root pose + 29 DOF。
-- Isaac 和 mjlab 分别 forward kinematics。
-- 对比 `torso_link`、左右 ankle、左右 wrist、head/upper body 等关键 body pose。
-- 输出 position/orientation error，并设定可接受阈值。
+- 对 4 条局部 mjlab NPZ 各取 `frame=0/middle/last` 做 Isaac-vs-mjlab FK 对齐。
+- 输出 CSV/JSON 汇总，记录每个 body 的最大/平均 position/orientation error。
+- 优先检查大幅度手臂、脚踝、腰部动作；如果误差集中在某些 body，再回查 joint order、body origin 或 XML/URDF 差异。
 
 ### P1：扩大局部数据和训练验证
 
@@ -396,6 +426,18 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
   algo.config.num_mini_batches=1
 ```
 
+
+运行 Isaac-vs-mjlab 单帧 FK 对齐：
+
+```bash
+conda run -n sonic python gear_sonic/scripts/check_isaac_mjlab_fk_alignment.py \
+  --bones-csv data/partial_bones_seed/g1_csv/220714/change_idle_left_to_idle_001__A025.csv \
+  --mjlab-npz data/partial_bones_seed/mjlab_motions_100f/220714/change_idle_left_to_idle_001__A025.npz \
+  --frame 0 \
+  --device cpu \
+  --headless \
+  --output-json logs/data_processing/isaac_mjlab_fk_frame0.json
+```
 
 运行短 rollout sanity：
 
