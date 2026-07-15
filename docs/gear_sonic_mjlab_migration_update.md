@@ -228,6 +228,8 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
 
 FK 是 forward kinematics，即给定 root 位姿和 29 DOF 关节角后，直接计算各个 body/link 的世界坐标和姿态。这个检查不涉及 policy、reward 或训练，只验证同一帧动作在 Isaac G1 和 mjlab/MuJoCo G1 上的几何结果是否一致。
 
+当前没有手写新的 G1 XML：Isaac 路径使用仓库内 `gear_sonic/data/assets/robot_description/urdf/g1/main.urdf`，mjlab 路径使用 `/home/wuchenghui/mjlab/src/mjlab/asset_zoo/robots/unitree_g1/xmls/g1.xml`。两者来自不同格式和导入路径，Isaac importer 还会把若干 fixed/inertial links merge 到父 link。当前厘米级位置误差和小角度姿态误差更符合资产/导入器/body frame 差异；不是 joint order、单位或 body index 这类代码错误的典型表现。
+
 新增 `gear_sonic/scripts/check_isaac_mjlab_fk_alignment.py`，已用局部 Bones partial 数据验证：
 
 ```bash
@@ -253,6 +255,28 @@ conda run -n sonic python gear_sonic/scripts/check_isaac_mjlab_fk_alignment.py \
 
 注意：GPU Isaac/PhysX 运行曾因当前机器显存分配失败而无法创建 PhysicsScene；CPU headless 模式可完成该单帧检查。
 
+批量 FK 扫描也已完成，新增 `gear_sonic/scripts/check_isaac_mjlab_fk_batch.py`：
+
+```bash
+conda run -n sonic python gear_sonic/scripts/check_isaac_mjlab_fk_batch.py \
+  --csv-root data/partial_bones_seed/g1_csv \
+  --npz-root data/partial_bones_seed/mjlab_motions_100f \
+  --limit 4 \
+  --frames 0,middle,last \
+  --device cpu \
+  --headless \
+  --output-json logs/data_processing/isaac_mjlab_fk_batch_partial.json \
+  --output-csv logs/data_processing/isaac_mjlab_fk_batch_partial.csv
+```
+
+结果：
+
+- 4 条局部 motion，每条 3 帧，共 12 个 FK checks。
+- 最大位置误差：`0.02153 m`，平均位置误差均值：`0.00553 m`。
+- 最大姿态误差：`0.26676 rad`，平均姿态误差均值：`0.08915 rad`。
+- 位置误差全部低于 `0.05 m`；4/12 个姿态 check 略高于临时 `0.25 rad` 阈值。
+- 结论：没有看到 joint order/unit/body index 错误会导致的几十厘米到米级偏差；剩余姿态差异需要按 body frame/URDF importer/MJCF 固有差异继续收紧阈值和解释。
+
 ### 短 rollout sanity
 
 新增 `gear_sonic/scripts/check_mjlab_rollout_sanity.py`，已在局部 Bones/mjlab NPZ 上验证：
@@ -271,6 +295,60 @@ conda run -n sonic python gear_sonic/scripts/check_mjlab_rollout_sanity.py \
 - reset: `actor_obs (16, 160)`, `critic_obs (16, 286)`。
 - zero action 3 step: reward finite，`done_sum=0`。
 - random action 3 step: reward finite，`done_sum=0`。
+
+4 条局部 mjlab NPZ 已逐条重跑短 rollout sanity，全部通过：
+
+- `change_idle_left_to_idle_001__A025.npz`: zero `0.19157`，random `0.16945`，`done_sum=0`。
+- `change_idle_left_to_idle_001__A025_M.npz`: zero `0.19195`，random `0.17048`，`done_sum=0`。
+- `change_idle_left_to_idle_001__A026.npz`: zero `0.19819`，random `0.18380`，`done_sum=0`。
+- `change_idle_left_to_idle_001__A026_M.npz`: zero `0.20016`，random `0.18913`，`done_sum=0`。
+
+### checkpoint reload 验证
+
+已用 `logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260715_161345/last.pt` 验证 checkpoint reload：
+
+```bash
+conda run -n sonic python gear_sonic/train_agent_trl.py \
+  +exp=mjlab/sonic_mjlab_minimal \
+  checkpoint=/home/wuchenghui/GR00T-WholeBodyControl/logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260715_161345/last.pt \
+  num_envs=16 \
+  mjlab_env.motion_file=/home/wuchenghui/GR00T-WholeBodyControl/data/partial_bones_seed/mjlab_motions_100f/220714/change_idle_left_to_idle_001__A025.npz \
+  algo.config.num_steps_per_env=4 \
+  algo.config.num_learning_iterations=1 \
+  algo.config.num_learning_epochs=1 \
+  algo.config.num_mini_batches=1 \
+  use_wandb=false
+```
+
+结果：
+
+- 日志显示 `Loaded checkpoint from step 10`。
+- 完成 16 env x 4 step x 1 iteration。
+- 保存新 checkpoint：`logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260715_192154/last.pt`。
+
+### mjlab eval plumbing
+
+新增 `gear_sonic/scripts/eval_mjlab_plumbing.py`，用于先验证 mjlab checkpoint eval 管线：创建 mjlab env、加载 policy/value checkpoint、用 deterministic action mean rollout、输出 reward 和 mjlab MotionCommand tracking metrics。
+
+```bash
+conda run -n sonic python gear_sonic/scripts/eval_mjlab_plumbing.py \
+  --checkpoint logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260715_161345/last.pt \
+  --motion-npz data/partial_bones_seed/mjlab_motions_100f/220714/change_idle_left_to_idle_001__A025.npz \
+  --mjlab-source-path /home/wuchenghui/mjlab/src \
+  --num-envs 16 \
+  --steps 16 \
+  --device cuda:0 \
+  --output-json logs/data_processing/mjlab_eval_plumbing_partial.json
+```
+
+结果：
+
+- checkpoint global step: `10`。
+- `reward_finite: true`，`done_count: 0`。
+- reward mean/min/max: `0.06203 / 0.05790 / 0.06755`。
+- command metrics mean: anchor pos `0.08117`，body pos `0.06630`，joint pos `1.81204`。
+
+这一步只是 eval plumbing，不代表官方 `success_rate/mpjpe_l/mpjpe_g` 已经完全对齐。后续需要把 mjlab metrics 输出格式进一步对齐 official eval callback。
 
 ### 小训练趋势验证
 
@@ -342,7 +420,7 @@ joint_pos_limits: (1, 29, 2)
 
 处理：改为按 mjlab 实际 `robot.body_names` 顺序索引 NPZ 中的 body arrays，避免使用方向容易混淆的 body mapping 常量。
 
-验证：同一 frame 重跑后通过，最大位置误差 `0.01097 m`，最大姿态误差 `0.22117 rad`。
+验证：同一 frame 重跑后通过，最大位置误差 `0.01097 m`，最大姿态误差 `0.22117 rad`。批量 4 motion x 3 frame 扫描的最大位置误差为 `0.02153 m`，没有出现大尺度错位。
 
 ## 已知问题
 
@@ -358,15 +436,24 @@ joint_pos_limits: (1, 29, 2)
 
 ## 下一步
 
-### P0：把单帧 FK 扩展成多帧/多 motion 扫描
+### P0：扩大姿态覆盖并解释剩余姿态误差
 
-单帧 FK 已通过，但还需要覆盖更多姿态，避免只在 idle/小动作上成立：
+已完成 4 条局部 motion x 3 frame 的 FK 扫描。下一步应覆盖更大动作幅度，并把姿态误差分解到具体 body frame：
 
-- 对 4 条局部 mjlab NPZ 各取 `frame=0/middle/last` 做 Isaac-vs-mjlab FK 对齐。
-- 输出 CSV/JSON 汇总，记录每个 body 的最大/平均 position/orientation error。
-- 优先检查大幅度手臂、脚踝、腰部动作；如果误差集中在某些 body，再回查 joint order、body origin 或 XML/URDF 差异。
+- 从已解压 CSV 中抽 50-100 条，优先包含手臂、腰、脚踝大幅动作。
+- 批量转换 mjlab NPZ，并跑 FK batch。
+- 对姿态误差超过阈值的 body，比较 URDF joint origin/rpy 与 MJCF body quat/pos，判断是否是固定 frame 定义差异。
 
-### P1：扩大局部数据和训练验证
+### P1：Isaac 原版 vs mjlab 小数据训练对比
+
+可以做，但建议放在 FK/rollout/eval plumbing 之后：
+
+- 使用同一批 16-64 条 motion。
+- Isaac 走官方 motion_lib PKL，mjlab 走对应 NPZ。
+- 使用尽量接近的 obs/reward/termination 子集和相同训练预算。
+- 比较 reward trend、termination reason、anchor/body error，而不是期待早期曲线逐点一致。
+
+### P2：扩大局部数据和训练验证
 
 已完成：
 
@@ -381,7 +468,7 @@ joint_pos_limits: (1, 29, 2)
 - checkpoint reload 后继续 rollout。
 - 比较不同 motion 的 reward/error/termination 分布，确认不是只在单条 idle motion 上可跑。
 
-### P2：实现 mjlab eval 指标
+### P3：实现 mjlab eval 指标
 
 对齐官方 training guide 的 eval 口径：
 
@@ -391,7 +478,7 @@ joint_pos_limits: (1, 29, 2)
 
 初期不要求达到官方收敛指标，但要能稳定计算并用于 Isaac-vs-mjlab 横向比较。
 
-### P3：逐步恢复 SONIC 特性
+### P4：逐步恢复 SONIC 特性
 
 在基础 PPO/mjlab 链路和正确性验证稳定后，再逐步加入：
 
