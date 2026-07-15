@@ -253,6 +253,36 @@ def convert_bones_csv_to_mjlab_npz(
     )
 
 
+def _iter_input_output_pairs(
+    input_path: Path,
+    output_path: Path,
+    limit: int | None,
+    skip_existing: bool,
+) -> list[tuple[Path, Path]]:
+    if input_path.is_file():
+        if input_path.suffix.lower() != ".csv":
+            raise ValueError(f"--input file must be a CSV, got {input_path}")
+        return [(input_path, output_path)]
+
+    if not input_path.is_dir():
+        raise FileNotFoundError(input_path)
+
+    csv_files = sorted(input_path.rglob("*.csv"))
+    if limit is not None:
+        csv_files = csv_files[:limit]
+    if not csv_files:
+        raise FileNotFoundError(f"no CSV files found under {input_path}")
+
+    pairs = []
+    for csv_file in csv_files:
+        relative = csv_file.relative_to(input_path).with_suffix(".npz")
+        npz_file = output_path / relative
+        if skip_existing and npz_file.exists():
+            continue
+        pairs.append((csv_file, npz_file))
+    return pairs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
@@ -262,16 +292,40 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-output-frames", type=int, default=None)
     parser.add_argument("--mjlab-source-path", default=None)
-    args = parser.parse_args()
-    convert_bones_csv_to_mjlab_npz(
-        input_file=args.input,
-        output_file=args.output,
-        input_fps=args.input_fps,
-        output_fps=args.output_fps,
-        device=args.device,
-        max_output_frames=args.max_output_frames,
-        mjlab_source_path=args.mjlab_source_path,
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="When --input is a directory, convert at most this many CSV files.",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="When --input is a directory, skip output NPZ files that already exist.",
+    )
+    args = parser.parse_args()
+
+    pairs = _iter_input_output_pairs(
+        input_path=args.input,
+        output_path=args.output,
+        limit=args.limit,
+        skip_existing=args.skip_existing,
+    )
+    if not pairs:
+        print("no files to convert")
+        return
+
+    for index, (input_file, output_file) in enumerate(pairs, start=1):
+        print(f"[{index}/{len(pairs)}] {input_file} -> {output_file}")
+        convert_bones_csv_to_mjlab_npz(
+            input_file=input_file,
+            output_file=output_file,
+            input_fps=args.input_fps,
+            output_fps=args.output_fps,
+            device=args.device,
+            max_output_frames=args.max_output_frames,
+            mjlab_source_path=args.mjlab_source_path,
+        )
 
 
 if __name__ == "__main__":

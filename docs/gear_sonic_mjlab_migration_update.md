@@ -58,6 +58,16 @@
 
 注意：padded NPZ 只是为了验证训练链路，不是最终训练数据；Bones CSV 转换器才是后续正式数据路径的起点。
 
+
+### 数据格式判断：官方 motion_lib PKL vs mjlab NPZ
+
+- Bones-SEED G1 CSV 是源数据：包含 root translation/rotation 和 29 DOF retargeted robot joint motion。
+- 官方 `convert_soma_csv_to_motion_lib.py` 的输出是 SONIC motion_lib PKL，服务于原 Isaac/SONIC motion library 路径。
+- mjlab tracking env 不直接读取 motion_lib PKL；当前 mjlab loader 需要 `.npz`，至少包含 `joint_pos`、`joint_vel`、`body_pos_w`、`body_quat_w`、`body_lin_vel_w`、`body_ang_vel_w`。
+- 因此官方转换脚本仍应保留给 Isaac/原 SONIC 路径，但 mjlab 路径需要独立的 Bones CSV -> mjlab tracking NPZ 转换。
+- smoke 记录需要明确数据来源：早期 padded smoke 使用 deploy reference CSV，不是官方 Bones motion_lib；后续 full-body smoke 使用一个 Bones CSV 经 mjlab FK 转成 NPZ。
+
+
 ## 已验证
 
 ### 环境与依赖
@@ -79,6 +89,12 @@
 - 基于已抽样 Bones CSV 生成过 full-body FK NPZ：
   - `data/mjlab_smoke/motions/warm_up_neck_001__A360_M_mjlab_fk_100f.npz`
   - shape: `joint_pos (100, 29)`, `body_pos_w (100, 30, 3)`
+  - finite 检查通过。
+- 批量目录模式已通过 smoke：
+  - 输入目录：`data/mjlab_smoke/bones_csv`
+  - 输出：`data/mjlab_smoke/motions_batch/warm_up_neck_001__A360_M.npz`
+  - 参数：`--limit 1 --max-output-frames 10 --skip-existing`
+  - shape: `joint_pos (10, 29)`, `body_pos_w (10, 30, 3)`
   - finite 检查通过。
 - padded NPZ key/shape 检查通过：
   - `joint_pos`: `(1375, 29)`
@@ -213,7 +229,7 @@ joint_pos_limits: (1, 29, 2)
 
 下一步：
 
-- 支持目录批量转换。
+- 已支持目录批量转换、`--limit` 和 `--skip-existing`。
 - 增加更严格的 joint/body name 和 order 断言。
 - 对转换后的 motion 做可视化或数值 sanity。
 
