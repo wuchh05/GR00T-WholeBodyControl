@@ -25,9 +25,14 @@ terrain: flat
 mjlab_env:
   # Optional when using the sibling checkout at /home/wuchenghui/mjlab/src.
   source_path: null
-  # Required: mjlab tracking .npz with joint_pos, joint_vel, body_pos_w,
-  # body_quat_w, body_lin_vel_w, body_ang_vel_w.
-  motion_file: ???
+  # For a single motion, pass motion_file. For multi-motion training, pass
+  # motion_dir or motion_files; files must be mjlab tracking .npz files with
+  # joint_pos, joint_vel, body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w.
+  motion_file: null
+  motion_files: null
+  motion_dir: null
+  motion_glob: "**/*.npz"
+  max_motions: null
   has_state_estimation: true
   play: false
   episode_length_s: 10.0

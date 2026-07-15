@@ -32,6 +32,33 @@ def _maybe_add_mjlab_source_path(config) -> None:
         sys.path.insert(0, source_path)
 
 
+def _resolve_motion_files(mjlab_cfg: Any) -> list[str]:
+    motion_files: list[str] = []
+
+    configured_files = mjlab_cfg.get("motion_files", None)
+    if configured_files is not None:
+        motion_files.extend(str(path) for path in configured_files)
+
+    motion_dir = mjlab_cfg.get("motion_dir", None)
+    if motion_dir is not None:
+        motion_glob = mjlab_cfg.get("motion_glob", "**/*.npz")
+        motion_files.extend(str(path) for path in sorted(Path(motion_dir).glob(motion_glob)))
+
+    motion_file = mjlab_cfg.get("motion_file", None)
+    if motion_file is not None and not motion_files:
+        motion_files.append(str(motion_file))
+
+    max_motions = mjlab_cfg.get("max_motions", None)
+    if max_motions is not None:
+        motion_files = motion_files[: int(max_motions)]
+
+    missing = [path for path in motion_files if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(f"mjlab motion file(s) do not exist: {missing[:5]}")
+
+    return motion_files
+
+
 def create_mjlab_env(config, device: str) -> MjlabSonicEnvWrapper:
     """Create the first-stage G1 flat tracking mjlab environment.
 
@@ -72,14 +99,35 @@ def create_mjlab_env(config, device: str) -> MjlabSonicEnvWrapper:
     if physics_dt is not None:
         env_cfg.sim.mujoco.timestep = float(physics_dt)
 
-    motion_file = mjlab_cfg.get("motion_file", None)
-    if motion_file is None:
+    motion_files = _resolve_motion_files(mjlab_cfg)
+    if not motion_files:
         raise ValueError(
-            "sim_type=mjlab requires mjlab_env.motion_file pointing to a mjlab tracking .npz motion file."
+            "sim_type=mjlab requires mjlab_env.motion_file, motion_files, or motion_dir pointing to mjlab tracking .npz files."
         )
-    if not os.path.exists(motion_file):
-        raise FileNotFoundError(f"mjlab_env.motion_file does not exist: {motion_file}")
-    env_cfg.commands["motion"].motion_file = motion_file
+
+    motion_cmd = env_cfg.commands["motion"]
+    motion_cmd.motion_file = motion_files[0]
+    if len(motion_files) > 1:
+        from gear_sonic.envs.mjlab_multi_motion import MultiMotionCommandCfg
+
+        env_cfg.commands["motion"] = MultiMotionCommandCfg(
+            entity_name=motion_cmd.entity_name,
+            resampling_time_range=motion_cmd.resampling_time_range,
+            debug_vis=motion_cmd.debug_vis,
+            pose_range=dict(motion_cmd.pose_range),
+            velocity_range=dict(motion_cmd.velocity_range),
+            joint_position_range=motion_cmd.joint_position_range,
+            adaptive_kernel_size=motion_cmd.adaptive_kernel_size,
+            adaptive_lambda=motion_cmd.adaptive_lambda,
+            adaptive_uniform_ratio=motion_cmd.adaptive_uniform_ratio,
+            adaptive_alpha=motion_cmd.adaptive_alpha,
+            sampling_mode="uniform" if motion_cmd.sampling_mode == "adaptive" else motion_cmd.sampling_mode,
+            motion_file=motion_files[0],
+            motion_files=tuple(motion_files),
+            anchor_body_name=motion_cmd.anchor_body_name,
+            body_names=motion_cmd.body_names,
+            viz=motion_cmd.viz,
+        )
 
     render_mode = "rgb_array" if not bool(config.get("headless", True)) else None
     raw_env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)

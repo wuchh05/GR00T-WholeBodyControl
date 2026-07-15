@@ -99,6 +99,7 @@ training = [
     "transformers>=4.56.2",
     "accelerate>=1.3.0",
     "tensorboard",
+    "vector-quantize-pytorch",
     "smpl_sim @ git+https://github.com/ZhengyiLuo/SMPLSim.git",
 ]
 

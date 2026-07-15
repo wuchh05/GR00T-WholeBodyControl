@@ -53,7 +53,7 @@
 
 - 新增 `gear_sonic/scripts/summarize_training_compare.py`：
   - 从 Isaac/mjlab 训练日志中提取 iteration 和 Mean rewards。
-  - 输出 JSON，便于后续 50-100 条 motion 的训练对比复用同一套汇总口径。
+  - 输出 JSON，便于后续多 motion 训练对比复用同一套汇总口径。
 - 新增 `gear_sonic/data_process/pack_reference_motion_to_mjlab_npz.py`：
   - 将 `gear_sonic_deploy/reference/example/<motion>/` 中的 deploy reference CSV 打包成 mjlab tracking `.npz`。
   - 支持 `--body-count` padding，用于 smoke test。
@@ -65,6 +65,11 @@
 
 注意：padded NPZ 只是为了验证训练链路，不是最终训练数据；Bones CSV 转换器才是后续正式数据路径的起点。
 
+
+- 新增 `gear_sonic/envs/mjlab_multi_motion.py`：
+  - 提供 `MultiMotionLoader` / `MultiMotionCommand`。
+  - 每个 env reset 时抽取一条 motion 和局部帧，并记录该 env 当前 motion 的结束帧，避免简单拼接 NPZ 后跨 motion 边界。
+  - `mjlab_env.motion_dir` / `motion_files` / `max_motions` 会自动启用多 motion 路径。
 
 ### 数据格式判断：官方 motion_lib PKL vs mjlab NPZ
 
@@ -98,7 +103,21 @@ conda run -n sonic python gear_sonic/data_process/filter_and_copy_bones_data.py 
   --workers 16
 ```
 
-截至记录时，全量任务仍处于解压阶段，尚未进入官方 Step1；局部验证目录已用当前已解压 CSV 跑通官方 Step1/Step2。
+当前审计结果：
+
+- `bones-seed/g1.tar.gz` 存在，大小约 22G。
+- tar 包内 CSV 数：`142220`。
+- `bones-seed/extracted/g1/csv` 已解压 CSV 数：`142220`。
+- 0 字节 CSV 数：`0`。
+- 因此 G1 CSV 下载和解压可以判定为完整。
+
+全量官方 Step1/Step2 已放入 detached tmux session：`bones_full_processing`。日志文件形如：
+
+```bash
+logs/data_processing/full_bones_processing_20260715_203300.log
+```
+
+截至 2026-07-15 21:10 左右，官方 Step1 已产出 `142220` 个 PKL；tmux session 仍在运行，后续会继续执行 Step2 filter 到 `data/motion_lib_bones_seed/robot_filtered`。局部验证目录已用当前已解压 CSV 跑通官方 Step1/Step2。
 
 ## 已验证
 
@@ -111,6 +130,11 @@ conda run -n sonic python gear_sonic/data_process/filter_and_copy_bones_data.py 
   - `rsl-rl-lib==5.4.0`
 - `sonic` 环境可以 import 本地 mjlab：
   - `sys.path.insert(0, "/home/wuchenghui/mjlab/src"); import mjlab`
+- 官方 universal-token 依赖 `vector_quantize_pytorch` 已补齐：
+  - PyPI 包名：`vector-quantize-pytorch`。
+  - 代码 import 名：`vector_quantize_pytorch`。
+  - 官方 `sonic_release` / `sonic_bones_seed` 配置通过 `gear_sonic/config/actor_critic/quantizers/fsq.yaml` 使用 `_target_: vector_quantize_pytorch.FSQ`，因此这是 training guide 官方脚本的必需依赖。
+  - 已加入 `gear_sonic[training]` 依赖声明。
 
 ### 数据
 
@@ -132,6 +156,10 @@ conda run -n sonic python gear_sonic/data_process/filter_and_copy_bones_data.py 
   - 输出：`data/partial_bones_seed/mjlab_motions_100f`。
   - 参数：`--limit 4 --max-output-frames 100`。
   - 结果：4 条 NPZ，每条 `frames=100 joints=29 bodies=30`。
+- 128 条对比数据已生成：
+  - 输入 CSV：`data/mjlab_compare/bones_128_csv`。
+  - mjlab NPZ：`data/mjlab_compare/bones_128_npz_100f`，结果 `128/128`，每条 `frames=100 joints=29 bodies=30`。
+  - Isaac motion_lib PKL：`data/mjlab_compare/bones_128_motion_lib_robot_filtered`，结果 `128/128 converted`，过滤后 `128`。
 - 局部对齐检查已通过：
   - CSV: `data/partial_bones_seed/g1_csv/220714/change_idle_left_to_idle_001__A025.csv`。
   - NPZ: `data/partial_bones_seed/mjlab_motions_100f/220714/change_idle_left_to_idle_001__A025.npz`。
@@ -381,6 +409,10 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
 - 仍可见短 rollout 初期 `Mean length: nan` / empty-slice warning，这是 episode buffer 初期为空导致的日志问题，不阻断训练。
 
 
+### mjlab 多 motion smoke
+
+已用 `data/partial_bones_seed/mjlab_motions_100f` 中 4 条 NPZ 验证多 motion 路径。结果：CommandManager 显示 `MultiMotionCommand`，actor obs `(160,)`、critic obs `(286,)`、action `(29,)`，完成训练并保存 checkpoint。
+
 ### Isaac-vs-mjlab 小训练对比
 
 已完成一组单 motion、同预算、低成本 paired comparison。为了避免官方 universal-token 配置的额外依赖和特性混入，这里使用两个 minimal MLP 配置：
@@ -408,7 +440,50 @@ python gear_sonic/scripts/summarize_training_compare.py \
 
 结论：两边在同一条 partial Bones motion 上都能完成训练，obs/action 维度一致，reward 均呈正向趋势，且没有 NaN/崩溃。这能证明 mjlab pipeline 不是只会跑空 rollout，而是能进入可学习闭环。它还不能证明和 Isaac 官方训练最终效果等价，因为当前只用了单 motion、10 iterations、minimal MLP 子集，且两边 reward/termination 实现仍有细节差异。
 
-官方 `sonic_release` 全量配置的 Isaac 对比暂未完成：首次尝试时暴露了 `open3d` 和 `vector_quantize_pytorch` 依赖问题。`open3d` 已改为可选依赖；`vector_quantize_pytorch` 仍需要安装或替换后才能跑 universal-token 路径。
+官方 `sonic_release` 全量配置的 Isaac 对比暂未完成：首次尝试时暴露了 `open3d` 和 `vector_quantize_pytorch` 依赖问题。`open3d` 已改为可选依赖；`vector_quantize_pytorch` 已安装并加入 training 依赖，后续可以继续验证 universal-token 路径。
+
+### Isaac-vs-mjlab 128 motion 训练对比
+
+已完成 128 条 motion、同预算 paired comparison：
+
+- Isaac: `gear_sonic/config/exp/manager/sonic_isaac_minimal.yaml`，motion 使用 `data/mjlab_compare/bones_128_motion_lib_robot_filtered`。
+- mjlab: `gear_sonic/config/exp/mjlab/sonic_mjlab_minimal.yaml`，motion 使用 `data/mjlab_compare/bones_128_npz_100f`，通过 `MultiMotionCommand` 采样。
+- 预算：`num_envs=64`、`num_steps_per_env=8`、`num_learning_iterations=10`、`num_learning_epochs=1`、`num_mini_batches=1`。
+
+| backend | log dir | Mean rewards trend | final Mean rewards |
+| --- | --- | --- | --- |
+| Isaac minimal | `logs_rl/TRL_G1_Isaac_Minimal/sonic_isaac_minimal-20260715_204443` | `0.34267 -> 1.34873` | `1.34873` |
+| mjlab minimal | `logs_rl/TRL_G1_MjLab/sonic_mjlab_minimal-20260715_204329` | `0.28502 -> 1.35795` | `1.35795` |
+
+汇总 JSON：`logs/data_processing/training_compare_128_64x8x10.json`。
+
+结论：扩到 128 条 motion 后，两边仍然都能学习，最终 reward 非常接近，mjlab final - Isaac final 约 `0.00922`。这比单 motion smoke 更有说服力，但仍属于短训练、minimal MLP、低预算趋势对比；还不是官方 4096 env / universal-token / 长训复现。
+
+### 官方 `sonic_release` tiny smoke
+
+`vector_quantize_pytorch` 安装后，已运行 training guide 默认 `sonic_release` 配置的极小 smoke：
+
+```bash
+conda run -n sonic python gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/all_modes/sonic_release \
+  num_envs=4 headless=True use_wandb=false \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/wuchenghui/GR00T-WholeBodyControl/data/mjlab_compare/bones_128_motion_lib_robot_filtered \
+  ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=/home/wuchenghui/GR00T-WholeBodyControl/data/smpl_filtered \
+  ++algo.config.num_steps_per_env=2 \
+  ++algo.config.num_learning_iterations=1 \
+  ++algo.config.num_learning_epochs=1 \
+  ++algo.config.num_mini_batches=1
+```
+
+日志：`logs/data_processing/sonic_release_smoke_after_vector_quantize.log`。结果：
+
+- universal-token module 初始化成功。
+- FSQ quantizer 初始化成功，embedding dim `64`。
+- g1 / teleop / smpl encoders 初始化成功。
+- g1_dyn / g1_kin decoders 初始化成功。
+- 进入 `Learning iteration 1`，完成 4 env x 2 step tiny PPO smoke。
+
+这说明 training guide 官方配置的依赖阻塞已解除；但这仍只是 tiny smoke，不是官方收敛复现。
 
 ## 已解决问题
 
@@ -475,6 +550,22 @@ joint_pos_limits: (1, 29, 2)
 
 验证：Isaac Mean rewards `0.00000 -> 1.78443`，mjlab Mean rewards `0.00000 -> 1.93785`；两边都正向、无 NaN、保存 checkpoint。
 
+### 7. `vector_quantize_pytorch` 缺失
+
+现象：官方 `sonic_release`/`sonic_bones_seed` universal-token 配置需要 `vector_quantize_pytorch.FSQ`，但当前 `sonic` 环境缺少该包。
+
+处理：执行 `conda run -n sonic python -m pip install vector-quantize-pytorch`，并将 `vector-quantize-pytorch` 加入 `gear_sonic[training]` 依赖。
+
+验证：`from vector_quantize_pytorch import FSQ; FSQ(levels=[8,5,5,5])` 通过。
+
+### 8. mjlab 多 motion 采样
+
+现象：mjlab 原生 `MotionLoader` 只读取单个 NPZ，不能直接覆盖 100+ motion 对比。
+
+处理：新增 SONIC 侧 `MultiMotionLoader` / `MultiMotionCommand`，并在 `create_mjlab_env()` 中支持 `mjlab_env.motion_dir`、`motion_files`、`max_motions`。
+
+验证：4 条 NPZ smoke 通过；128 条 NPZ、64 env x 8 step x 10 iterations 训练通过。
+
 ## 已知问题
 
 ### 1. seed 逻辑暂时保守
@@ -483,13 +574,9 @@ joint_pos_limits: (1, 29, 2)
 
 等多环境和正式 motion 转换稳定后，需要重新恢复和验证可复现 seed。
 
-### 2. mjlab 当前只接单个 NPZ motion file
+### 2. 官方 `sonic_release` 仍未做长训/效果复现
 
-`mjlab.tasks.tracking.mdp.MotionLoader` 当前通过 `np.load(motion_file)` 读取单个 NPZ。局部小训练趋势和 Isaac-vs-mjlab 第一版训练对比都使用单条 motion；后续如果要多 motion 采样，需要扩展 loader 或在外层合并/采样 motion。
-
-### 3. 官方 `sonic_release` universal-token 对比仍缺依赖
-
-官方 release 配置会走 universal-token/quantizer 路径，当前 `sonic` 环境缺少 `vector_quantize_pytorch`。因此本轮对比使用 minimal MLP 配置，不是官方全量 SONIC 配置。要做 official-vs-mjlab 复现对比，需要先补齐该依赖并确认 checkpoint/config 能加载。
+`vector_quantize_pytorch` 已补齐，`open3d` 也已改为可选依赖；官方 `sonic_release` tiny smoke 已能初始化 universal-token/FSQ/encoders/decoders 并进入 PPO iteration。当前仍未完成的是长训收敛、checkpoint finetune/reload、官方 eval 指标复现。128 motion 对比仍是 minimal MLP，不是官方全量 SONIC。
 
 ## 下一步
 
@@ -501,15 +588,15 @@ joint_pos_limits: (1, 29, 2)
 - 批量转换 mjlab NPZ，并跑 FK batch。
 - 对姿态误差超过阈值的 body，比较 URDF joint origin/rpy 与 MJCF body quat/pos，判断是否是固定 frame 定义差异。
 
-### P1：扩大 Isaac-vs-mjlab 训练对比
+### P1：官方 `sonic_release` checkpoint reload / eval smoke
 
-第一版单 motion minimal 对比已完成。下一步应把它从“能学”推进到“统计上更可信”：
+官方 `sonic_release` tiny train smoke 已完成。下一步应验证 release checkpoint 和官方 eval plumbing：
 
-- 抽 16-64 条 partial/full Bones motion。
-- Isaac 使用官方 motion_lib PKL；mjlab 使用对应 NPZ。
-- mjlab 需要先支持多 motion 采样，或者先写外层 runner 逐条跑固定预算并汇总。
-- 对比 reward trend、termination reason、anchor/body error、checkpoint reload/eval plumbing，而不是期待早期曲线逐点一致。
-- official `sonic_release` 对比要先补齐 `vector_quantize_pytorch`，再逐步打开 tokenizer/universal-token/aux loss。
+- 使用 `+checkpoint=sonic_release/last.pt` 做 finetune/reload smoke。
+- `num_envs=16/64`、短 rollout、1-2 iterations。
+- 跑 `eval_agent_trl.py` 的 metrics mode 小规模 smoke。
+- 确认 tokenizer obs、universal-token actor、aux losses、SMPL motion path、checkpoint key 都能加载。
+- 通过后再考虑把 mjlab wrapper 逐步扩展到 tokenizer/universal-token 所需 observation/action 语义。
 
 ### P2：扩大局部数据和训练验证
 
