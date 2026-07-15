@@ -1,6 +1,6 @@
 # GEAR-SONIC MuJoCo/mjlab 迁移更新记录
 
-更新时间：2026-07-14
+更新时间：2026-07-15
 
 ## 目标
 
@@ -68,6 +68,31 @@
 - smoke 记录需要明确数据来源：早期 padded smoke 使用 deploy reference CSV，不是官方 Bones motion_lib；后续 full-body smoke 使用一个 Bones CSV 经 mjlab FK 转成 NPZ。
 
 
+## 当前数据处理任务
+
+已按官方训练指南启动一个顺序任务，不停止现有 Hugging Face 下载进程：
+
+1. 解压 `bones-seed/g1.tar.gz` 到 `bones-seed/extracted/g1/csv`。
+2. 执行官方 Step1：`convert_soma_csv_to_motion_lib.py`，输出到 `data/motion_lib_bones_seed/robot`。
+3. 执行官方 Step2：`filter_and_copy_bones_data.py`，输出到 `data/motion_lib_bones_seed/robot_filtered`。
+
+启动命令：
+
+```bash
+mkdir -p bones-seed/extracted data/motion_lib_bones_seed
+tar -xzf bones-seed/g1.tar.gz -C bones-seed/extracted
+conda run -n sonic python gear_sonic/data_process/convert_soma_csv_to_motion_lib.py \
+  --input bones-seed/extracted/g1/csv \
+  --output data/motion_lib_bones_seed/robot \
+  --fps 30 --fps_source 120 --individual --num_workers 16
+conda run -n sonic python gear_sonic/data_process/filter_and_copy_bones_data.py \
+  --source data/motion_lib_bones_seed/robot \
+  --dest data/motion_lib_bones_seed/robot_filtered \
+  --workers 16
+```
+
+截至记录时，任务仍处于解压阶段，尚未进入官方 Step1。
+
 ## 已验证
 
 ### 环境与依赖
@@ -82,6 +107,15 @@
 
 ### 数据
 
+- 新增第一层 mjlab 对齐检查脚本：
+  - `gear_sonic/scripts/check_mjlab_alignment.py`
+  - 不依赖 Isaac Lab，可在 `sonic` 环境运行。
+  - 检查 Bones CSV 必需列、IsaacLab->MuJoCo DOF 映射、mjlab 29 joint lookup、14 tracking body lookup、anchor body、NPZ shape/finite。
+- 对齐检查已通过：
+  - Bones CSV: `data/mjlab_smoke/bones_csv/warm_up_neck_001__A360_M.csv`
+  - mjlab NPZ: `data/mjlab_smoke/motions_batch/warm_up_neck_001__A360_M.npz`
+  - mjlab joint indexes: `0..28`
+  - tracking bodies: 14 个，anchor body 为 `torso_link`。
 - 从正在下载的 Bones-SEED 压缩包中抽出过一个小 CSV：
   - `data/mjlab_smoke/bones_csv/warm_up_neck_001__A360_M.csv`
 - 基于仓库已有 deploy reference 生成过 smoke NPZ：
@@ -248,6 +282,17 @@ joint_pos_limits: (1, 29, 2)
 - mjlab G1 joint order 对齐。
 - tracking body names 与 `unitree_g1_flat_tracking_env_cfg()` 一致。
 
+### P0.5：正确性验证路线
+
+从低成本到高成本逐步推进：
+
+1. 静态顺序检查：joint/body/order、anchor body、NPZ shape/finite。已完成第一版脚本和 smoke。
+2. 单帧 FK 对齐：同一 Bones frame 在 mjlab 和 Isaac 中 forward kinematics，比较 torso/ankle/wrist/head 等 body pose。
+3. 短 rollout 数值 sanity：zero/random action 下比较 obs、reward term、termination reason 的量级和趋势。
+4. 小规模训练趋势：10-50 条 motion，`num_envs=64`，10-100 iterations，检查 reward/episode length/loss/entropy 不 NaN 且趋势合理。
+5. 官方 eval 指标复现：实现或适配 success rate、MPJPE local/global、render video。
+6. 长训练复现：再对齐官方训练指南中的收敛指标，不把它作为早期迁移正确性的唯一判断。
+
 ### P1：扩大并行训练 smoke
 
 已完成：
@@ -296,6 +341,16 @@ conda run -n sonic python gear_sonic/train_agent_trl.py \
   algo.config.num_mini_batches=1
 ```
 
+
+运行第一层 mjlab 对齐检查：
+
+```bash
+conda run -n sonic python gear_sonic/scripts/check_mjlab_alignment.py \
+  --bones-csv data/mjlab_smoke/bones_csv/warm_up_neck_001__A360_M.csv \
+  --motion-npz data/mjlab_smoke/motions_batch/warm_up_neck_001__A360_M.npz \
+  --mjlab-source-path /home/wuchenghui/mjlab/src \
+  --device cuda:0
+```
 
 生成 Bones full-body FK NPZ：
 
