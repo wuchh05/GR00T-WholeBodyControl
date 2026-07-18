@@ -6,10 +6,13 @@ Run this before training or deployment to verify all prerequisites are met.
 Usage:
     python check_environment.py              # Check everything
     python check_environment.py --training   # Training checks only
+    python check_environment.py --mjlab      # MuJoCo/mjlab training checks
+    python check_environment.py --npu        # Ascend torch-npu checks
     python check_environment.py --deploy     # Deployment checks only
 """
 
 import importlib
+import importlib.metadata
 import os
 import platform
 import shutil
@@ -25,7 +28,7 @@ def check(name, passed, msg_pass="", msg_fail=""):
     return passed
 
 
-def check_python(training=False):
+def check_python(training=False, reason="training"):
     v = sys.version_info
     version_str = f"{v.major}.{v.minor}.{v.micro}"
     if training:
@@ -34,7 +37,7 @@ def check_python(training=False):
             "Python version",
             ok,
             msg_pass=version_str,
-            msg_fail=f"{version_str} (training requires 3.11.x — Isaac Lab requirement)",
+            msg_fail=f"{version_str} ({reason} requires 3.11.x)",
         )
     else:
         ok = v.major == 3 and v.minor >= 10
@@ -110,10 +113,9 @@ def check_isaaclab():
 
 def check_gear_sonic():
     try:
-        from importlib.metadata import version as get_version
-        ver = get_version("gear_sonic")
+        ver = importlib.metadata.version("gear_sonic")
         return check("gear_sonic", True, msg_pass=f"installed ({ver})")
-    except ImportError:
+    except importlib.metadata.PackageNotFoundError:
         return check(
             "gear_sonic",
             False,
@@ -139,6 +141,46 @@ def check_training_deps():
                 check(pip_name, False, msg_fail=f"not installed (pip install {pip_name})")
             )
     return all(results)
+
+
+def check_mjlab():
+    try:
+        import mjlab
+
+        version = getattr(mjlab, "__version__", "unknown")
+        return check("mjlab", True, msg_pass=version)
+    except ImportError:
+        return check(
+            "mjlab",
+            False,
+            msg_fail="not installed (pip install 'mjlab==1.5.0' or run install_scripts/install_mjlab_training.sh)",
+        )
+
+
+def check_mujoco():
+    try:
+        import mujoco
+
+        version = getattr(mujoco, "__version__", "unknown")
+        return check("MuJoCo", True, msg_pass=version)
+    except ImportError:
+        return check("MuJoCo", False, msg_fail="not installed (installed by mjlab)")
+
+
+def check_torch_npu():
+    try:
+        import torch
+        import torch_npu  # noqa: F401
+
+        try:
+            count = torch.npu.device_count()
+            available = torch.npu.is_available()
+            detail = f"torch_npu imported, devices={count}, available={available}"
+            return check("Ascend NPU", available and count > 0, msg_pass=detail, msg_fail=detail)
+        except Exception as exc:
+            return check("Ascend NPU", False, msg_fail=f"torch_npu import ok, runtime check failed: {exc}")
+    except ImportError as exc:
+        return check("torch-npu", False, msg_fail=f"not installed or not importable: {exc}")
 
 
 def check_tensorrt():
@@ -183,6 +225,10 @@ def main():
     mode = "all"
     if "--training" in sys.argv:
         mode = "training"
+    elif "--mjlab" in sys.argv:
+        mode = "mjlab"
+    elif "--npu" in sys.argv:
+        mode = "npu"
     elif "--deploy" in sys.argv:
         mode = "deploy"
 
@@ -195,9 +241,11 @@ def main():
 
     # Basic checks (always run)
     print("Basic:")
-    all_pass &= check_python(training=(mode in ("all", "training")))
+    python_reason = "training/mjlab" if mode in ("mjlab", "npu") else "training"
+    all_pass &= check_python(training=(mode in ("all", "training", "mjlab", "npu")), reason=python_reason)
     all_pass &= check_git_lfs()
-    all_pass &= check_cuda()
+    if mode not in ("mjlab", "npu"):
+        all_pass &= check_cuda()
     all_pass &= check_torch()
     all_pass &= check_disk_space()
     print()
@@ -207,6 +255,19 @@ def main():
         all_pass &= check_isaaclab()
         all_pass &= check_gear_sonic()
         all_pass &= check_training_deps()
+        print()
+
+    if mode in ("all", "mjlab", "npu"):
+        print("mjlab Training:")
+        all_pass &= check_gear_sonic()
+        all_pass &= check_training_deps()
+        all_pass &= check_mjlab()
+        all_pass &= check_mujoco()
+        print()
+
+    if mode in ("all", "npu"):
+        print("Ascend NPU:")
+        all_pass &= check_torch_npu()
         print()
 
     if mode in ("all", "deploy"):

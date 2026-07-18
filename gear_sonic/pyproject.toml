@@ -102,6 +102,20 @@ training = [
     "vector-quantize-pytorch",
     "smpl_sim @ git+https://github.com/ZhengyiLuo/SMPLSim.git",
 ]
+# MuJoCo/mjlab training path.  This is intentionally separate from the Isaac
+# training extra so users can install a lightweight CPU-rollout environment on
+# machines where Isaac Sim cannot run, including Ascend NPU hosts.
+# Usage: pip install -e "gear_sonic[training,mjlab]"
+mjlab = [
+    "mjlab>=1.5.0,<1.6.0",
+]
+# Ascend NPU runtime hook.  The exact torch-npu/CANN/PyTorch matrix is platform
+# specific; install_scripts/install_mjlab_training.sh lets users override the
+# torch-npu wheel or package spec with TORCH_NPU_PACKAGE.
+# Usage: pip install -e "gear_sonic[training,mjlab,npu]"
+npu = [
+    "torch-npu",
+]
 
 [tool.setuptools.packages.find]
 where = [".."]

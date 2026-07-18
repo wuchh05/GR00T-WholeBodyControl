@@ -227,6 +227,23 @@ For the full guide including multi-node training, evaluation, ONNX export, and S
 📖 [Installation (Training)](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/installation_training.html) |
 [Training Guide](https://nvlabs.github.io/GR00T-WholeBodyControl/user_guide/training.html)
 
+### mjlab / Ascend NPU training setup
+
+For the MuJoCo/mjlab path, including CPU rollout plus Ascend `torch-npu`
+training experiments, use the dedicated installer:
+
+```bash
+# CPU rollout/development
+bash install_scripts/install_mjlab_training.sh
+
+# Ascend NPU host; install CANN/driver first, then provide the matching torch-npu package if needed
+DEVICE_BACKEND=npu TORCH_NPU_PACKAGE='torch-npu' \
+    bash install_scripts/install_mjlab_training.sh
+```
+
+See `docs/source/getting_started/installation_mjlab_npu.md` for data conversion,
+smoke training, and verification commands.
+
 
 ## TODOs
 

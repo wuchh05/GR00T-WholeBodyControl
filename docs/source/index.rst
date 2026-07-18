@@ -102,6 +102,7 @@ Documentation
    :caption: Training
 
    getting_started/installation_training
+   getting_started/installation_mjlab_npu
    user_guide/training
    user_guide/training_data
    user_guide/new_embodiments
