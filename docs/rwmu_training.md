@@ -18,18 +18,60 @@ recording transitions.
 
 ## Environment Installation
 
-Use a separate environment for RWM-U if possible. The model-based RSL-RL package
-uses the same import name, `rsl_rl`, as regular RSL-RL, so installing it replaces
-the normal `rsl_rl` import in that environment. SONIC itself uses TRL for the
-release training path, but keeping RWM-U separate avoids accidental dependency
-confusion.
+Use two environments. The reason is simple: upstream RWM-U depends on
+`rsl_rl_rwm`, which installs as the Python package name `rsl_rl`. That can replace
+the regular `rsl_rl` used by Isaac/RSL-RL projects. SONIC release training uses
+TRL rather than RSL-RL, but keeping RWM-U separate still avoids accidental import
+or dependency conflicts.
+
+### Environment A: SONIC / Isaac
+
+Use this environment for original SONIC training, Isaac rollout export, policy
+evaluation, and final SONIC policy fine-tuning.
 
 ```bash
-# In the SONIC/Isaac training environment, or a cloned environment:
-pip install -e gear_sonic[training,rwm]
+conda create -n sonic-isaac python=3.11 -y
+conda activate sonic-isaac
 
-# RWM-U extension and model-based RSL-RL.
-# If these directories are absent after cloning this repo, fetch them first:
+# Install Isaac Lab / Isaac Sim in this environment first, following the Isaac
+# Lab installation guide used by SONIC.
+
+pip install -e "gear_sonic[training,rwm]"
+```
+
+Do not install `external_dependencies/rsl_rl_rwm` here unless you deliberately
+want one mixed smoke environment. This environment is the one that runs commands
+such as:
+
+```bash
+python gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/all_modes/sonic_release \
+  +checkpoint=sonic_release/last.pt \
+  num_envs=4096 headless=True
+
+python gear_sonic/scripts/export_rwmu_transitions.py \
+  --output /tmp/sonic_rwmu_export.pt --steps 128 --device cuda -- \
+  +exp=rwm/sonic_release +checkpoint=sonic_release/last.pt num_envs=64 headless=True
+```
+
+The current exporter smoke uses the RWM smoke backend. Full Isaac export still
+needs Isaac AppLauncher wiring before it can export real Isaac transitions.
+
+### Environment B: RWM-U
+
+Use this environment for RWM-U dynamics/offline imagination training. It does not
+need to launch Isaac for the bundled upstream smoke data.
+
+```bash
+conda create -n rwmu python=3.11 -y
+conda activate rwmu
+
+# Choose the PyTorch/CUDA build that matches the training machine. Example only:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+pip install -e "gear_sonic[rwm]"
+
+# Fetch upstream code if it is not already present after clone.
 git clone https://github.com/leggedrobotics/robotic_world_model.git external_dependencies/robotic_world_model
 git clone https://github.com/leggedrobotics/rsl_rl_rwm.git external_dependencies/rsl_rl_rwm
 
@@ -37,36 +79,54 @@ pip install -e external_dependencies/robotic_world_model/source/mbrl
 pip install -e external_dependencies/rsl_rl_rwm
 ```
 
-The RWM-U smoke path does not require launching Isaac. Isaac is only needed when
-you export SONIC transitions from the real SONIC training environment.
+This environment is the one that runs:
+
+```bash
+python gear_sonic/scripts/run_rwmu_offline_smoke.py \
+  --device cuda --num-envs 2 --num-steps-per-env 2 \
+  --max-iterations 1 --max-episode-length 8 \
+  --output-dir /tmp/rwmu_offline_smoke
+```
+
+When SONIC-specific RWM-U data has been exported, train RWM-U in this environment
+on that exported dataset. The trained RWM-U checkpoint can then be loaded by a
+SONIC-side adapter. If the adapter imports only PyTorch checkpoint code, keep it
+inside the SONIC environment. If it imports `rsl_rl_rwm` classes directly, run the
+adapter in the RWM-U environment or vendor a small inference-only loader.
 
 ## Upstream RWM-U Data Format
 
-The upstream offline loader reads sequential CSV files named
-`state_action_data_0.csv`, `state_action_data_1.csv`, etc. Each file has no
-header and each row is one transition label at time `t`:
+Think of the RWM-U dataset as a simulator diary. Each row is one time step from a
+real simulator rollout:
 
 ```text
-system_state_t | system_action_t | system_extension_t | system_contact_t | system_termination_t
+what the robot is now | what action was applied | extra labels | contact labels | failure labels
 ```
 
-The loader slices the columns in this order using task-specific dimensions. For
-the upstream ANYmal-D smoke task the dimensions are:
+The upstream file is named `state_action_data_0.csv`. It has no column names
+because the code already knows how many numbers belong to each block. In the
+bundled ANYmal-D smoke example, the first 45 numbers are robot state, the next 12
+numbers are action, then 0 extension numbers, 8 contact numbers, and 1
+termination number.
 
-- `system_state`: 45
-- `system_action`: 12
-- `system_extension`: 0
-- `system_contact`: 8
-- `system_termination`: 1
+A tiny toy row would look conceptually like this:
 
-For SONIC, use the schema in `gear_sonic/config/rwm/sonic_schema.yaml` instead
-of the ANYmal dimensions. Keep episode rows contiguous and mark learned
-termination on the final failed row. Do not learn `time_out`; keep it separate
-for PPO bootstrap correction.
+```text
+[base velocity, gravity, joint pos, joint vel, torque] | [12 motor commands] | [] | [feet/thigh contacts] | [base hit ground]
+```
+
+SONIC uses a humanoid, so its row is wider. The idea is unchanged: keep a
+continuous episode as continuous rows, and let RWM-U learn how action at time `t`
+changes the robot state at time `t+1`. The target motion file alone is not enough
+because it has no applied policy action and no simulated robot response.
 
 ## SONIC To RWM-U Field Contract
 
-The SONIC release policy/trainer fields are validated by:
+The field contract means: for every thing Isaac gives SONIC during training, we
+must decide where that thing lives in the RWM-U row. This is just bookkeeping so
+we can later replace Isaac without changing the SONIC policy/trainer interface.
+
+The validation commands are:
 
 ```bash
 python gear_sonic/scripts/validate_rwm_config_parity.py \
@@ -74,70 +134,37 @@ python gear_sonic/scripts/validate_rwm_config_parity.py \
 python gear_sonic/scripts/validate_sonic_rwmu_fields.py
 ```
 
-Required RWM-U groups for SONIC:
+The five groups mean:
 
-### system_action
+- `system_state`: clean robot state. Example: `joint_pos` is 29 numbers because
+  release SONIC controls 29 body joints. `body_pos_w` is `14 x 3` numbers because
+  SONIC tracks 14 body links and each link has xyz world position.
+- `system_action`: the action that actually reaches the simulator. For SONIC this
+  is the final 29D joint-position command after action transform/clipping, not an
+  intermediate latent or noisy observation.
+- `system_extension`: extra continuous labels, mainly reward information. Example:
+  `tracking_anchor_pos` says how far the robot pelvis/anchor is from the target
+  motion anchor; `reward_total` is the final scalar reward.
+- `system_contact`: contact labels. Example: whether feet or other bodies touch
+  the ground, plus aggregates such as `undesired_contacts`.
+- `system_termination`: failure labels. Example: `anchor_pos` becomes true when
+  the robot drifts too far from the target anchor. `time_out` is not learned; it
+  is just episode length bookkeeping.
 
-Use the final applied 29D joint-position action that reaches Isaac, after action
-transform and clipping. In `ManagerEnvWrapper.step`, this is `env_actions` just
-before `self.env.step(env_actions)`.
+So a SONIC row is conceptually:
 
-### system_state
+```text
+[clean humanoid state and motion cursor] |
+[29D applied joint action] |
+[reward term labels and total reward] |
+[contact flags] |
+[failure flags]
+```
 
-Use clean simulator/robot state, not noisy `actor_obs`. Recommended first layout:
-
-1. `root_pos_w`: 3
-2. `root_quat_w`: 4, wxyz
-3. `root_lin_vel_b`: 3
-4. `root_ang_vel_b`: 3
-5. `joint_pos`: 29
-6. `joint_vel`: 29
-7. `body_pos_w`: 14 x 3
-8. `body_quat_w`: 14 x 4, wxyz
-9. `body_lin_vel_w`: 14 x 3
-10. `body_ang_vel_w`: 14 x 3
-11. `last_action`: 29
-12. `motion_id`: 1
-13. `motion_time_step`: 1
-14. `motion_start_time_step`: 1
-
-The tracked body order is the order in `sonic_schema.yaml`.
-
-### system_extension
-
-Store every SONIC release reward term before weighting, every weighted
-contribution, and total reward. The release reward labels are:
-
-- `tracking_anchor_pos`
-- `tracking_anchor_ori`
-- `tracking_relative_body_pos`
-- `tracking_relative_body_ori`
-- `tracking_body_linvel`
-- `tracking_body_angvel`
-- `action_rate_l2`
-- `joint_limit`
-- `undesired_contacts`
-- `anti_shake_ang_vel`
-- `tracking_vr_5point_local`
-- `feet_acc`
-- `reward_total`
-
-### system_contact
-
-At minimum, store per-body contact flags and the `undesired_contacts` aggregate.
-Prefer storing foot/wrist/ankle contact flags explicitly because several reward
-and termination terms depend on contact or foot state.
-
-### system_termination
-
-Learn only physical/task failure terms:
-
-- `anchor_pos`
-- `anchor_ori_full`
-- `ee_body_pos`
-- `foot_pos_xyz`
-
-Keep `time_out` separate from learned termination.
+The noisy `actor_obs` that enters the policy is not the best training target for
+RWM-U. It is derived from clean state by adding history, target motion, and noise.
+RWM-U should predict clean state/contact/failure; the adapter can rebuild
+SONIC-style `actor_obs`, `critic_obs`, reward, and done from those predictions.
 
 ## Smoke Training
 
