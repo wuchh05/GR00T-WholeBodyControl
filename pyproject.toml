@@ -1,7 +1,11 @@
-# Root pyproject.toml — tooling configuration only.
-# To install packages, use:
-#   pip install -e decoupled_wbc/        (or decoupled_wbc[full], decoupled_wbc[dev])
-#   pip install -e gear_sonic/           (or gear_sonic[teleop], gear_sonic[sim])
+# Root pyproject.toml - tooling configuration only.
+# Install runnable packages from their package directories after cloning:
+#   pip install -e decoupled_wbc/
+#   pip install -e "gear_sonic[training]"          # SONIC training, Isaac Lab installed separately
+#   pip install -e "gear_sonic[training,rwm]"      # RWM-U adapter/exporter smoke path
+#   pip install -e "gear_sonic[training,mjlab]"    # MuJoCo/mjlab path
+# Git LFS is only needed for large in-repo assets/checkpoints; code paths below
+# install without LFS when data and models are downloaded separately.
 
 [tool.black]
 line-length = 100

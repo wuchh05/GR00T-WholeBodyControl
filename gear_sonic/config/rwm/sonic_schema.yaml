@@ -1,0 +1,105 @@
+# SONIC release tracking schema for RWM-U dataset/exporter alignment.
+# Matches +exp=manager/universal_token/all_modes/sonic_release unless overridden.
+
+action:
+  group: system_action
+  terms:
+    - name: joint_pos
+      dim: 29
+      source: isaaclab.envs.mdp.actions.JointPositionActionCfg
+      config: gear_sonic/config/manager_env/actions/terms/joint_pos.yaml
+      notes: raw policy action is scaled and offset by default joint positions before PD control
+
+policy_observation:
+  group: actor_obs
+  config: gear_sonic/config/manager_env/observations/policy/local_dir_hist.yaml
+  dim: 930
+  concatenate_terms: true
+  terms:
+    - {name: gravity_dir, source: gear_sonic.envs.manager_env.mdp.gravity_dir, dim: 30, base_dim: 3, history_length: 10}
+    - {name: base_ang_vel, source: isaaclab.envs.mdp.base_ang_vel, dim: 30, base_dim: 3, history_length: 10}
+    - {name: joint_pos, source: isaaclab.envs.mdp.joint_pos_rel, dim: 290, base_dim: 29, history_length: 10}
+    - {name: joint_vel, source: isaaclab.envs.mdp.joint_vel_rel, dim: 290, base_dim: 29, history_length: 10}
+    - {name: actions, source: isaaclab.envs.mdp.last_action, dim: 290, base_dim: 29, history_length: 10}
+
+critic_observation:
+  group: critic_obs
+  config: gear_sonic/config/manager_env/observations/critic/privileged_mf_hist.yaml
+  dim: 1645
+  concatenate_terms: true
+  terms:
+    - {name: command_multi_future, source: gear_sonic.envs.manager_env.mdp.command_multi_future, dim: 580, base_dim: 58, num_future_frames: 10}
+    - {name: motion_anchor_pos_b, source: gear_sonic.envs.manager_env.mdp.motion_anchor_pos_b, dim: 3}
+    - {name: motion_anchor_ori_b, source: gear_sonic.envs.manager_env.mdp.motion_anchor_ori_b, dim: 6}
+    - {name: body_pos, source: gear_sonic.envs.manager_env.mdp.robot_body_pos_b, dim: 42, base_dim: 42}
+    - {name: body_ori, source: gear_sonic.envs.manager_env.mdp.robot_body_ori_b, dim: 84, base_dim: 84}
+    - {name: base_lin_vel, source: isaaclab.envs.mdp.base_lin_vel, dim: 30, base_dim: 3, history_length: 10}
+    - {name: base_ang_vel, source: isaaclab.envs.mdp.base_ang_vel, dim: 30, base_dim: 3, history_length: 10}
+    - {name: joint_pos, source: isaaclab.envs.mdp.joint_pos_rel, dim: 290, base_dim: 29, history_length: 10}
+    - {name: joint_vel, source: isaaclab.envs.mdp.joint_vel_rel, dim: 290, base_dim: 29, history_length: 10}
+    - {name: actions, source: isaaclab.envs.mdp.last_action, dim: 290, base_dim: 29, history_length: 10}
+
+tokenizer_observation:
+  group: tokenizer
+  config: gear_sonic/config/manager_env/observations/tokenizer/unitoken_all_noz.yaml
+  concatenate_terms: false
+  terms:
+    - {name: encoder_index, dim: [3]}
+    - {name: command_multi_future_nonflat, dim: [10, 58]}
+    - {name: command_z_multi_future_nonflat, dim: [10, 1]}
+    - {name: motion_anchor_ori_b_mf_nonflat, dim: [10, 6]}
+    - {name: command_multi_future_lower_body, dim: [240]}
+    - {name: vr_3point_local_target, dim: [9]}
+    - {name: vr_3point_local_orn_target, dim: [12]}
+    - {name: motion_anchor_ori_b, dim: [6]}
+    - {name: command_z, dim: [1]}
+    - {name: smpl_joints_multi_future_local_nonflat, dim: [10, 72]}
+    - {name: smpl_root_ori_b_multi_future, dim: [10, 6]}
+    - {name: joint_pos_multi_future_wrist_for_smpl, dim: [10, 6]}
+
+reward:
+  group: system_extension
+  config: gear_sonic/config/manager_env/rewards/tracking/base_5point_local_feet_acc.yaml
+  terms:
+    - {name: tracking_anchor_pos, source: gear_sonic.envs.manager_env.mdp.tracking_anchor_pos_error}
+    - {name: tracking_anchor_ori, source: gear_sonic.envs.manager_env.mdp.tracking_anchor_ori_error}
+    - {name: tracking_relative_body_pos, source: gear_sonic.envs.manager_env.mdp.tracking_relative_body_pos_error}
+    - {name: tracking_relative_body_ori, source: gear_sonic.envs.manager_env.mdp.tracking_relative_body_ori_error}
+    - {name: tracking_body_linvel, source: gear_sonic.envs.manager_env.mdp.tracking_body_linvel_error}
+    - {name: tracking_body_angvel, source: gear_sonic.envs.manager_env.mdp.tracking_body_angvel_error}
+    - {name: action_rate_l2, source: isaaclab.envs.mdp.action_rate_l2}
+    - {name: joint_limit, source: isaaclab.envs.mdp.joint_pos_limits}
+    - {name: undesired_contacts, source: isaaclab.envs.mdp.undesired_contacts}
+    - {name: anti_shake_ang_vel, source: gear_sonic.envs.manager_env.mdp.anti_shake_ang_vel_l2}
+    - {name: tracking_vr_5point_local, source: gear_sonic.envs.manager_env.mdp.tracking_local_vr_5point_error}
+    - {name: feet_acc, source: isaaclab.envs.mdp.joint_acc_l2, override_weight_in_sonic_release: -2.5e-6}
+
+termination:
+  group: system_termination
+  config: gear_sonic/config/manager_env/terminations/tracking/base_adaptive_strict_ori_foot_xyz.yaml
+  notes: keep learned terminations separate from timeout for PPO bootstrap correction
+  terms:
+    - {name: anchor_pos, source: gear_sonic.envs.manager_env.mdp.exceeded_anchor_height, threshold: 0.15, adaptive: true}
+    - {name: anchor_ori_full, source: gear_sonic.envs.manager_env.mdp.exceeded_anchor_ori, threshold: 0.2}
+    - {name: ee_body_pos, source: gear_sonic.envs.manager_env.mdp.exceeded_body_height, threshold: 0.15, adaptive: true}
+    - {name: foot_pos_xyz, source: gear_sonic.envs.manager_env.mdp.exceeded_body_pos, threshold: 0.2}
+    - {name: time_out, source: gear_sonic.envs.manager_env.mdp.tracking_time_out, learned: false}
+
+tracked_bodies:
+  anchor_body: pelvis
+  reward_point_body: [torso_link, left_wrist_yaw_link, right_wrist_yaw_link]
+  body_names:
+    - pelvis
+    - left_hip_roll_link
+    - left_knee_link
+    - left_ankle_roll_link
+    - right_hip_roll_link
+    - right_knee_link
+    - right_ankle_roll_link
+    - torso_link
+    - left_shoulder_roll_link
+    - left_elbow_link
+    - left_wrist_yaw_link
+    - right_shoulder_roll_link
+    - right_elbow_link
+    - right_wrist_yaw_link

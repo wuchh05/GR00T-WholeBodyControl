@@ -1,0 +1,56 @@
+# @package _global_
+# Minimal RWM/RWM-U adapter smoke test. This does not load a trained dynamics
+# model; it verifies that SONIC PPO can run against a non-Isaac imagined env.
+
+defaults:
+  - /algo: ppo_im_phc
+  - override /trainer: trl
+  - _self_
+
+sim_type: rwm
+use_manager_env: false
+
+project_name: TRL_G1_RWM
+experiment_name: sonic_rwm_smoke
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 16
+headless: true
+use_wandb: false
+
+env: rwm_g1_tracking
+terrain: flat
+
+rwm_env:
+  backend: smoke
+  actor_obs_dim: 137
+  critic_obs_dim: 221
+  action_dim: 29
+  num_critics: 1
+  episode_length_s: 10.0
+  step_dt: 0.02
+  smoke_reward_scale: 1.0
+
+callbacks:
+  model_save:
+    save_frequency: 10
+    save_last_frequency: 1
+    max_disk_usage: null
+
+algo:
+  config:
+    num_steps_per_env: 4
+    num_learning_iterations: 1
+    num_learning_epochs: 1
+    num_mini_batches: 1
+    empty_cache_every_n_ppo_epoch: -1
+    actor:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [256, 256]
+    critic:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [256, 256]

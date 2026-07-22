@@ -102,6 +102,14 @@ training = [
     "vector-quantize-pytorch",
     "smpl_sim @ git+https://github.com/ZhengyiLuo/SMPLSim.git",
 ]
+# RWM-U adapter/exporter path.  The upstream RWM code is kept in
+# external_dependencies/robotic_world_model for reference; this extra only adds
+# lightweight Python dependencies needed by SONIC-side adapter/exporter scripts.
+# Usage: pip install -e "gear_sonic[training,rwm]"
+rwm = [
+    "pandas",
+    "tensordict",
+]
 # MuJoCo/mjlab training path.  This is intentionally separate from the Isaac
 # training extra so users can install a lightweight CPU-rollout environment on
 # machines where Isaac Sim cannot run, including Ascend NPU hosts.

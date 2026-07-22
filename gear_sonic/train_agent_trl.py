@@ -150,7 +150,12 @@ def create_manager_env(config, device, args_cli):
 @hydra.main(config_path="config", config_name="base", version_base="1.1")
 def main(config: OmegaConf):
     sim_type = str(config.get("sim_type", "isaacsim")).lower()
-    simulator_type = "MjLab" if sim_type in {"mjlab", "mujoco"} else "IsaacSim"
+    if sim_type in {"mjlab", "mujoco"}:
+        simulator_type = "MjLab"
+    elif sim_type in {"rwm", "rwm-u", "rwm_u", "world_model"}:
+        simulator_type = "RWM"
+    else:
+        simulator_type = "IsaacSim"
     env_config = config.get("manager_env", None)
     from transformers import HfArgumentParser
     from trl import ModelConfig, PPOConfig, ScriptArguments
@@ -319,6 +324,10 @@ def main(config: OmegaConf):
         )
         env_config.config.experiment_dir = str(Path(config.experiment_dir))
         env = create_manager_env(config, device, args_cli)
+    elif simulator_type == "RWM":
+        from gear_sonic.envs.rwm_env import create_rwm_env
+
+        env = create_rwm_env(config, device)
     else:
         from gear_sonic.envs.mjlab_env import create_mjlab_env
 
