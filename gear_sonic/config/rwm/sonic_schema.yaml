@@ -103,3 +103,35 @@ tracked_bodies:
     - right_shoulder_roll_link
     - right_elbow_link
     - right_wrist_yaw_link
+
+
+rwm_u_dynamics_schema:
+  name: sonic-rwmu-clean-v1
+  purpose: clean dynamics target for SONIC-specific RWM-U training
+  tensor_layout:
+    state: [steps, num_envs, state_dim]
+    action: [steps, num_envs, 29]
+    extension: [steps, num_envs, extension_dim]
+    contact: [steps, num_envs, contact_dim]
+    termination: [steps, num_envs, 1]
+  state_terms_preferred:
+    - {name: root_lin_vel, source: robot.data.root_lin_vel_b, dim: 3}
+    - {name: root_ang_vel, source: robot.data.root_ang_vel_b, dim: 3}
+    - {name: projected_gravity, source: robot.data.projected_gravity_b, dim: 3}
+    - {name: joint_pos, source: robot.data.joint_pos, dim: 29}
+    - {name: joint_vel, source: robot.data.joint_vel, dim: 29}
+    - {name: body_pos_w, source: robot.data.body_pos_w, dim: 14x3_or_backend_body_count}
+    - {name: body_quat_w, source: robot.data.body_quat_w, dim: 14x4_or_backend_body_count}
+    - {name: body_lin_vel_w, source: robot.data.body_lin_vel_w, dim: 14x3_or_backend_body_count}
+    - {name: body_ang_vel_w, source: robot.data.body_ang_vel_w, dim: 14x3_or_backend_body_count}
+  action_terms:
+    - {name: policy_action, source: policy_state_dict.actions, dim: 29}
+  extension_terms:
+    - {name: reward_total, source: env.step.reward, dim: 1}
+    - {name: reward_terms_optional, source: infos.to_log or reward manager terms, dim: variable}
+  contact_terms:
+    - {name: contact_flags_optional, source: contact sensors when configured, dim: variable}
+  termination_terms:
+    - {name: done_excluding_timeout, source: dones AND NOT time_outs, dim: 1}
+  smoke_fallback:
+    notes: RWM smoke has no physical robot state; exporter marks missing terms as missing_zero_fallback and the dataset is only for plumbing tests.

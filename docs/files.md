@@ -34,5 +34,12 @@ are easy to miss in the larger SONIC tree.
 - `gear_sonic/scripts/export_rwmu_transitions.py` - backend-agnostic transition
   exporter for RWM-U datasets. It records obs/action/reward/done/timeouts and
   best-effort robot/motion state fields.
+- `gear_sonic/scripts/train_sonic_rwmu_dynamics.py` - trains a SONIC-specific
+  RWM-U `SystemDynamicsEnsemble` checkpoint from exported rollout datasets.
+- `gear_sonic/scripts/validate_sonic_rwmu_dataset.py` - validates exported SONIC
+  RWM-U dataset tensor ranks, dimensions, finite values, and schema metadata.
+- `gear_sonic/scripts/collect_sonic_rwmu_dataset.py` - collects SONIC rollouts
+  from one or more policy checkpoints and exports raw transitions plus RWM-U
+  `state/action/extension/contact/termination` tensors.
 - `external_dependencies/robotic_world_model/` - upstream ETH RWM/RWM-U codebase
   cloned for reference and later checkpoint/model integration.

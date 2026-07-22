@@ -10,7 +10,7 @@ Current status:
 - Upstream RWM-U bundled-data smoke training runs.
 - SONIC `+exp=rwm/sonic_release` smoke runs without Isaac using placeholder dynamics.
 - A real SONIC-trained `rwm_env.backend=rwmu` checkpoint loader is not implemented yet.
-- Full Isaac transition export still needs Isaac AppLauncher wiring; current exporter smoke uses the RWM smoke backend.
+- Policy rollout export supports RWM smoke, mjlab, and Isaac AppLauncher startup; real Isaac export must be run inside an Isaac Lab environment.
 
 ## 1. Clone
 
@@ -130,3 +130,52 @@ The intended stable path is:
 
 Step 4 is the missing implementation piece. Until it is added, use the commands
 above for installation, smoke testing, and field validation.
+
+
+## 6. SONIC Policy Rollout Export And Dynamics Smoke
+
+Collect rollout data with one or more SONIC policy checkpoints. Repeat
+`--checkpoint` or pass `--checkpoint-list` to mix policies for data diversity.
+The smoke command below uses the RWM placeholder environment only to verify the
+policy sampling and dataset format path:
+
+```bash
+python gear_sonic/scripts/collect_sonic_rwmu_dataset.py \
+  --output /tmp/sonic_rwmu_policy_smoke.pt \
+  --steps 16 \
+  --device cuda \
+  --action-source policy \
+  --checkpoint sonic_release/last.pt \
+  --checkpoint sonic_release/last.pt \
+  --policy-selection step_cycle \
+  -- +exp=rwm/sonic_release num_envs=2 headless=True use_wandb=false
+```
+
+Validate the exported RWM-U tensors:
+
+```bash
+python gear_sonic/scripts/validate_sonic_rwmu_dataset.py \
+  /tmp/sonic_rwmu_policy_smoke.pt --json
+```
+
+Train a minimal SONIC RWM-U dynamics checkpoint from the exported data:
+
+```bash
+python gear_sonic/scripts/train_sonic_rwmu_dynamics.py \
+  --dataset /tmp/sonic_rwmu_policy_smoke.pt \
+  --output /tmp/sonic_rwmu_dynamics_smoke.pt \
+  --report /tmp/sonic_rwmu_train_report.json \
+  --device cuda \
+  --history-horizon 8 \
+  --forecast-horizon 2 \
+  --ensemble-size 2 \
+  --hidden-size 64 \
+  --batch-size 8 \
+  --epochs 1
+```
+
+For real SONIC RWM training, run the same exporter with
+`+exp=manager/universal_token/all_modes/sonic_release` inside an Isaac Lab env.
+The smoke dataset reports `missing_zero_fallback:*` state terms because the RWM
+placeholder has no physical robot state; do not use smoke data for model quality
+claims.
