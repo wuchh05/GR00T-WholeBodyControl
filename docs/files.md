@@ -9,6 +9,8 @@ are easy to miss in the larger SONIC tree.
   fields, and the RWM-U field contract.
 - `docs/rwmu_training.md` - RWM-U install, bundled data, smoke training,
   SONIC field contract, and deployment commands.
+- `docs/rwmu_local_validation.md` - local RWM-U environment status, real-weight
+  smoke command, and 32-step open-loop error results.
 - `gear_sonic/config/exp/rwm/sonic_release.yaml` - RWM backend variant of the
   original `manager/universal_token/all_modes/sonic_release` experiment. It
   preserves the original SONIC policy/trainer architecture and only swaps the
@@ -27,6 +29,8 @@ are easy to miss in the larger SONIC tree.
   SONIC release schema covers required RWM-U groups and tracked body metadata.
 - `gear_sonic/scripts/run_rwmu_offline_smoke.py` - runs the upstream RWM-U
   offline training smoke using bundled ANYmal-D data and pretrained dynamics.
+- `gear_sonic/scripts/evaluate_rwmu_nstep.py` - evaluates n-step open-loop error
+  for the upstream bundled RWM-U dynamics checkpoint and CSV data.
 - `gear_sonic/scripts/export_rwmu_transitions.py` - backend-agnostic transition
   exporter for RWM-U datasets. It records obs/action/reward/done/timeouts and
   best-effort robot/motion state fields.
