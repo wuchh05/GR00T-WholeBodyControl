@@ -16,6 +16,33 @@ offline RWM-U pipeline runs, but it is not SONIC humanoid data. SONIC data must
 be exported from Isaac or another physical backend by rolling a policy and
 recording transitions.
 
+
+## Current Integration Mode
+
+The committed code currently implements the safe two-environment path. It does
+not yet load a real SONIC-trained RWM-U checkpoint inside `gear_sonic/envs/rwm_env.py`.
+The current `rwm_env.backend=smoke` proves that the SONIC PPO trainer can run
+without Isaac, but it uses synthetic placeholder dynamics.
+
+The intended production path is:
+
+1. `sonic-isaac` exports real SONIC/Isaac transition data.
+2. `rwmu` trains a RWM-U dynamics checkpoint on that exported data.
+3. A checkpoint loader is added behind `gear_sonic/envs/rwm_env.py`.
+4. SONIC PPO is launched with `+exp=rwm/sonic_release` and `rwm_env.backend=rwmu`.
+
+There are two possible loader designs for step 3:
+
+- Direct loader: install `rsl_rl_rwm` in the SONIC training environment and import
+  `SystemDynamicsEnsemble` directly. This is fastest for research, but it can
+  replace the normal `rsl_rl` import and may conflict with Isaac/RSL-RL tooling.
+- Inference-only loader: export the RWM-U model to a small PyTorch/TorchScript/ONNX
+  inference artifact and load that from the SONIC environment without importing
+  `rsl_rl_rwm`. This is the recommended long-term deployment path.
+
+Until the real `backend=rwmu` loader is implemented, use the current commands for
+smoke, field validation, and dataset preparation only.
+
 ## Environment Installation
 
 Use two environments. The reason is simple: upstream RWM-U depends on
@@ -223,3 +250,93 @@ python gear_sonic/scripts/run_rwmu_offline_smoke.py \
   --max-iterations 1 --max-episode-length 8 \
   --output-dir /tmp/rwmu_offline_smoke
 ```
+
+## Fresh Machine Checklist
+
+Use this sequence on a new machine.
+
+### 1. Clone SONIC repo
+
+```bash
+git clone <your-repo-url> GR00T-WholeBodyControl
+cd GR00T-WholeBodyControl
+```
+
+If `external_dependencies` was not committed with nested repositories, fetch the
+upstream RWM repositories:
+
+```bash
+git clone https://github.com/leggedrobotics/robotic_world_model.git external_dependencies/robotic_world_model
+git clone https://github.com/leggedrobotics/rsl_rl_rwm.git external_dependencies/rsl_rl_rwm
+```
+
+### 2. Create SONIC / Isaac environment
+
+```bash
+conda create -n sonic-isaac python=3.11 -y
+conda activate sonic-isaac
+
+# Install Isaac Lab / Isaac Sim first, following the SONIC/Isaac Lab guide.
+
+pip install -e "gear_sonic[training,rwm]"
+```
+
+Verify SONIC-side config and field contract:
+
+```bash
+python gear_sonic/scripts/validate_rwm_config_parity.py \
+  --num-envs 4096 --checkpoint sonic_release/last.pt
+python gear_sonic/scripts/validate_sonic_rwmu_fields.py
+```
+
+Optional SONIC no-Isaac smoke using placeholder dynamics:
+
+```bash
+python gear_sonic/train_agent_trl.py \
+  +exp=rwm/sonic_release \
+  +checkpoint=sonic_release/last.pt \
+  num_envs=2 headless=True \
+  algo.config.num_steps_per_env=2 \
+  algo.config.num_learning_iterations=1 \
+  algo.config.num_learning_epochs=1 \
+  algo.config.num_mini_batches=1 \
+  use_wandb=false
+```
+
+### 3. Create RWM-U training environment
+
+```bash
+conda create -n rwmu python=3.11 -y
+conda activate rwmu
+
+# Pick the PyTorch/CUDA command that matches the machine. Example:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+pip install -e "gear_sonic[rwm]"
+pip install -e external_dependencies/robotic_world_model/source/mbrl
+pip install -e external_dependencies/rsl_rl_rwm
+```
+
+Verify upstream RWM-U bundled-data smoke:
+
+```bash
+python gear_sonic/scripts/run_rwmu_offline_smoke.py \
+  --device cuda \
+  --num-envs 2 \
+  --num-steps-per-env 2 \
+  --max-iterations 1 \
+  --max-episode-length 8 \
+  --output-dir /tmp/rwmu_offline_smoke
+```
+
+Expected output:
+
+```text
+RWM-U offline smoke OK: /tmp/rwmu_offline_smoke/policy_0.pt
+```
+
+### 4. Train for real
+
+Real SONIC RWM-U training still needs a SONIC-specific exported dataset and a
+real `rwm_env.backend=rwmu` loader. The upstream ANYmal-D smoke dataset is not
+SONIC data and should not be used to train a SONIC humanoid world model.
