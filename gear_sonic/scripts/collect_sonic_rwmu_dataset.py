@@ -15,6 +15,7 @@ The exported ``.pt`` contains the raw trainer transition contract and a normaliz
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import random
 import sys
@@ -43,6 +44,11 @@ from gear_sonic.utils.config_utils import register_rl_resolvers
 from gear_sonic.utils.obs_utils import get_group_term_obs_shape
 
 register_rl_resolvers()
+
+
+def _debug(message: str) -> None:
+    if os.environ.get("SONIC_RWMU_DEBUG"):
+        print(f"[sonic-rwmu-export] {message}", flush=True)
 
 
 _PHYSX_STATE_SPECS = (
@@ -210,6 +216,21 @@ def _extract_action_to_sim(env: Any, fallback: torch.Tensor) -> torch.Tensor:
     return fallback.detach().cpu()
 
 
+def _get_action_dim(env: Any) -> int:
+    try:
+        value = env.config.get("robot", {}).get("actions_dim")
+        if value is not None:
+            return int(value)
+    except Exception:
+        pass
+    for candidate in (env, getattr(env, "env", None), getattr(env, "unwrapped", None)):
+        action_manager = getattr(candidate, "action_manager", None)
+        action = getattr(action_manager, "action", None)
+        if isinstance(action, torch.Tensor) and action.dim() >= 2:
+            return int(action.shape[-1])
+    return int(env.action_space.shape[-1])
+
+
 def _build_rwmu_groups(payload: dict[str, Any]) -> dict[str, Any]:
     steps = int(payload["steps"])
     num_envs = int(payload["num_envs"])
@@ -292,19 +313,30 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
     seeding(int(config.get("seed", 0)))
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
+    _debug("creating env")
     env, simulation_app = _create_env(config, args.device)
+    _debug("env created")
     try:
+        _debug("read num_envs begin")
         num_envs = int(env.num_envs)
-        action_dim = int(env.action_space.shape[-1])
+        _debug(f"read num_envs done: {num_envs}")
+        _debug("read action_dim begin")
+        action_dim = _get_action_dim(env)
+        _debug(f"read action_dim done: {action_dim}")
         checkpoint_paths = _select_checkpoint_paths(args)
         policies = []
         if args.action_source == "policy":
             if not checkpoint_paths:
                 raise ValueError("--action-source policy requires at least one --checkpoint")
+            _debug("updating env config for policy")
             _update_env_config_for_policy(env, config)
+            _debug(f"loading {len(checkpoint_paths)} policy checkpoint(s)")
             policies = [_load_policy(config, env, path, args.device) for path in checkpoint_paths]
+            _debug("policies loaded")
 
+        _debug("reset_all begin")
         obs = env.reset_all()
+        _debug("reset_all done")
         dones_for_policy = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
         records = {
             "obs": [],
@@ -324,6 +356,7 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
         }
 
         for step in range(args.steps):
+            _debug(f"step {step} action_select begin")
             if args.action_source == "zeros":
                 policy_state_dict = {"actions": torch.zeros(num_envs, action_dim, device=env.device)}
                 selected_policy = -1
@@ -344,10 +377,21 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
                     selected_policy = step % len(policy_outputs)
                 policy_state_dict = policy_outputs[selected_policy]
 
+            _debug(f"step {step} flatten obs begin")
             records["obs"].append(_flatten_obs_value(obs))
+            _debug(f"step {step} flatten obs done")
+            _debug(f"step {step} extract robot_state begin")
             records["robot_state"].append(_extract_robot_state(env))
-            records["motion_state"].append(_extract_motion_state(env))
+            _debug(f"step {step} extract robot_state done")
+            if args.record_motion_state:
+                _debug(f"step {step} extract motion_state begin")
+                records["motion_state"].append(_extract_motion_state(env))
+                _debug(f"step {step} extract motion_state done")
+            else:
+                records["motion_state"].append({})
+            _debug(f"step {step} env.step begin")
             next_obs, rewards, dones, infos = env.step(policy_state_dict)
+            _debug(f"step {step} env.step done")
             records["next_obs"].append(_flatten_obs_value(next_obs))
             records["next_robot_state"].append(_extract_robot_state(env))
             records["actions"].append(policy_state_dict["actions"].detach().cpu())
@@ -388,9 +432,12 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
             "policy_index": torch.stack(records["policy_index"], dim=0),
             "config": OmegaConf.to_container(config, resolve=False),
         }
+        _debug("building rwm_u groups")
         payload["rwm_u"] = _build_rwmu_groups(payload)
         args.output.parent.mkdir(parents=True, exist_ok=True)
+        _debug(f"saving {args.output}")
         torch.save(payload, args.output)
+        _debug("save done")
         return payload
     finally:
         try:
@@ -409,6 +456,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-list", type=Path, default=None, help="Text file with one checkpoint path per line.")
     parser.add_argument("--policy-selection", choices=["step_cycle", "random_step"], default="step_cycle")
     parser.add_argument("--stochastic", action="store_true", help="Sample stochastic policy actions instead of action_mean.")
+    parser.add_argument("--record-motion-state", action="store_true", help="Also export motion command internals; disabled by default because PhysX-only RWM-U does not train on them.")
     parser.add_argument("overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 

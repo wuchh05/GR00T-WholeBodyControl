@@ -169,9 +169,27 @@ joint_pos, joint_vel,
 body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w
 ```
 
-For the SONIC G1 release shape this is expected to be 262 dimensions when all
-14 tracked body tensors are present: root fields 22 + joint fields 58 + body
-fields 182. The action is expected to be 29 dimensions.
+For the real SONIC G1 release Isaac env, validation currently reports 470
+physics-state dimensions: root fields 22 + joint fields 58 + 30 robot bodies
+with position/quaternion/linear-velocity/angular-velocity fields. The action is
+29 dimensions, matching the Isaac Lab `joint_pos` action term.
+
+`collect_sonic_rwmu_dataset.py` deliberately skips `motion_state` by default.
+RWM-U does not train on future motion/reference internals, and some command
+properties are expensive or unsafe to materialize during Isaac export. Use
+`--record-motion-state` only for targeted debugging.
+
+A local real-Isaac smoke was verified with the release path, a 6-motion subset,
+`num_envs=1`, and random actions. The exported dataset validated as:
+
+```text
+state:       (2, 1, 470)
+next_state:  (2, 1, 470)
+action:      (2, 1, 29)
+contact:     (2, 1, 30)
+extension:   (2, 1, 0)
+termination: (2, 1, 0)
+```
 
 Sampling remains rollout-based because Isaac needs a valid simulator state before
 each transition. Training/validation can treat every exported row as an
