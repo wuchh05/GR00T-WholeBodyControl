@@ -12,7 +12,7 @@ import torch
 
 
 REQUIRED_TOP_LEVEL = ("format", "num_envs", "steps", "actions", "rewards", "dones", "time_outs", "rwm_u")
-REQUIRED_RWMU = ("state", "action", "extension", "contact", "termination", "schema")
+REQUIRED_RWMU = ("state", "next_state", "action", "extension", "contact", "termination", "schema")
 
 
 def _shape(value: Any):
@@ -31,7 +31,7 @@ def validate(path: Path) -> dict[str, Any]:
 
     steps = int(payload["steps"])
     num_envs = int(payload["num_envs"])
-    for key in ("state", "action", "extension", "contact", "termination"):
+    for key in ("state", "next_state", "action", "extension", "contact", "termination"):
         tensor = rwm[key]
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"rwm_u.{key} must be a tensor")
@@ -42,10 +42,11 @@ def validate(path: Path) -> dict[str, Any]:
         if not torch.isfinite(tensor).all():
             raise ValueError(f"rwm_u.{key} contains NaN/Inf")
 
-    if rwm["termination"].shape[-1] != 1:
-        raise ValueError("rwm_u.termination must have dim 1")
-    if rwm["action"].shape[-1] != payload["actions"].reshape(steps, num_envs, -1).shape[-1]:
-        raise ValueError("rwm_u.action dim does not match raw actions")
+    if rwm["state"].shape[-1] != rwm["next_state"].shape[-1]:
+        raise ValueError("rwm_u.state and rwm_u.next_state dims must match")
+    action_source = payload.get("env_actions_to_sim", payload["actions"])
+    if rwm["action"].shape[-1] != action_source.reshape(steps, num_envs, -1).shape[-1]:
+        raise ValueError("rwm_u.action dim does not match env_actions_to_sim/raw actions")
 
     state_terms = rwm["schema"].get("state_terms", [])
     missing_fallback_terms = [
@@ -64,12 +65,15 @@ def validate(path: Path) -> dict[str, Any]:
         "steps": steps,
         "num_envs": num_envs,
         "state_shape": _shape(rwm["state"]),
+        "next_state_shape": _shape(rwm["next_state"]),
         "action_shape": _shape(rwm["action"]),
         "extension_shape": _shape(rwm["extension"]),
         "contact_shape": _shape(rwm["contact"]),
         "termination_shape": _shape(rwm["termination"]),
         "state_source": rwm["schema"].get("state_source"),
+        "next_state_source": rwm["schema"].get("next_state_source"),
         "state_terms": state_terms,
+        "next_state_terms": rwm["schema"].get("next_state_terms", []),
         "missing_fallback_terms": missing_fallback_terms,
         "contact_terms": rwm["schema"].get("contact_terms", []),
     }
@@ -91,7 +95,7 @@ def main() -> None:
     else:
         print(
             f"OK {summary['path']} | steps={summary['steps']} num_envs={summary['num_envs']} "
-            f"state={summary['state_shape']} action={summary['action_shape']} "
+            f"state={summary['state_shape']} next_state={summary['next_state_shape']} action={summary['action_shape']} "
             f"extension={summary['extension_shape']} contact={summary['contact_shape']} "
             f"termination={summary['termination_shape']} source={summary['state_source']}"
         )

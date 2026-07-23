@@ -839,6 +839,12 @@ class ManagerEnvWrapper:
         if action_clip_value is not None and action_clip_value > 0:
             env_actions = torch.clip(env_actions, -action_clip_value, action_clip_value)
 
+        # This is the exact action tensor handed to the Isaac Lab env.  Policy
+        # outputs may be latent/residual actions that are decoded above, so data
+        # exporters must read this value when learning the PhysX transition.
+        self._last_env_actions_to_sim = env_actions.detach()
+        self.env._last_env_actions_to_sim = env_actions.detach()  # noqa: SLF001
+
         # Lightweight action plot update (env 0, first N joints)
         if self.turn_on_visualization:
             try:

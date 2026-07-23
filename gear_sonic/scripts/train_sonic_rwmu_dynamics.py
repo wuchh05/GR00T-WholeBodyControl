@@ -35,6 +35,7 @@ def _architecture_config(hidden_size: int) -> dict[str, Any]:
 
 def _load_concat(paths: list[Path], device: str):
     states = []
+    next_states = []
     actions = []
     extensions = []
     contacts = []
@@ -44,18 +45,21 @@ def _load_concat(paths: list[Path], device: str):
         payload = torch.load(path, map_location="cpu", weights_only=False)
         rwm = payload["rwm_u"]
         states.append(rwm["state"].float())
+        next_states.append(rwm.get("next_state", rwm["state"]).float())
         actions.append(rwm["action"].float())
         extensions.append(rwm["extension"].float())
         contacts.append(rwm["contact"].float())
         terminations.append(rwm["termination"].float())
         schemas.append(rwm.get("schema", {}))
     state_dim = states[0].shape[-1]
+    next_state_dim = next_states[0].shape[-1]
     action_dim = actions[0].shape[-1]
     extension_dim = extensions[0].shape[-1]
     contact_dim = contacts[0].shape[-1]
     termination_dim = terminations[0].shape[-1]
     for tensor_list, name, dim in (
         (states, "state", state_dim),
+        (next_states, "next_state", next_state_dim),
         (actions, "action", action_dim),
         (extensions, "extension", extension_dim),
         (contacts, "contact", contact_dim),
@@ -66,12 +70,25 @@ def _load_concat(paths: list[Path], device: str):
             raise ValueError(f"all datasets must share {name}_dim={dim}, got incompatible shapes {bad}")
     return (
         torch.cat(states, dim=1).to(device),
+        torch.cat(next_states, dim=1).to(device),
         torch.cat(actions, dim=1).to(device),
         torch.cat(extensions, dim=1).to(device),
         torch.cat(contacts, dim=1).to(device),
         torch.cat(terminations, dim=1).to(device),
         schemas,
     )
+
+
+def _make_physx_series(state: torch.Tensor, next_state: torch.Tensor, action: torch.Tensor):
+    if state.shape != next_state.shape:
+        raise ValueError(f"state shape {tuple(state.shape)} must match next_state shape {tuple(next_state.shape)}")
+    # Convert explicit transition rows (s_t, a_t, s_t+1) into the sequential
+    # state/action layout expected by upstream RWM-U. The final action is a pad
+    # value and is never used as an input for a real logged transition.
+    state_series = torch.cat([state, next_state[-1:].clone()], dim=0)
+    action_pad = torch.zeros_like(action[-1:])
+    action_series = torch.cat([action, action_pad], dim=0)
+    return state_series, action_series
 
 
 def _make_windows(state, action, extension, contact, termination, history: int, forecast: int):
@@ -114,7 +131,11 @@ def _make_windows(state, action, extension, contact, termination, history: int, 
 def train(args: argparse.Namespace) -> dict[str, Any]:
     from rsl_rl.modules import SystemDynamicsEnsemble
 
-    state, action, extension, contact, termination, schemas = _load_concat(args.dataset, args.device)
+    state, next_state, action, extension, contact, termination, schemas = _load_concat(args.dataset, args.device)
+    state, action = _make_physx_series(state, next_state, action)
+    extension = torch.cat([extension, torch.zeros_like(extension[-1:])], dim=0)
+    contact = torch.cat([contact, torch.zeros_like(contact[-1:])], dim=0)
+    termination = torch.cat([termination, torch.zeros_like(termination[-1:])], dim=0)
     state_mean = state.flatten(0, 1).mean(dim=0)
     state_std = state.flatten(0, 1).std(dim=0).clamp_min(1.0e-6)
     action_mean = action.flatten(0, 1).mean(dim=0)
@@ -167,7 +188,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
-        "format": "sonic-rwmu-dynamics-v1",
+        "format": "sonic-rwmu-physx-dynamics-v1",
         "iter": args.epochs,
         "system_dynamics_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),

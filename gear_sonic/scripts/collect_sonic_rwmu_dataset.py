@@ -4,11 +4,12 @@
 The exported ``.pt`` contains the raw trainer transition contract and a normalized
 ``rwm_u`` group with tensors shaped for SONIC-specific RWM-U dynamics training:
 
-- state: ``(steps, num_envs, state_dim)``
-- action: ``(steps, num_envs, action_dim)``
-- extension: ``(steps, num_envs, extension_dim)``; currently total reward
-- contact: ``(steps, num_envs, contact_dim)``; may be zero-width until sensors are wired
-- termination: ``(steps, num_envs, 1)``; excludes timeouts
+- state: ``(steps, num_envs, state_dim)``; PhysX input state before ``env.step``
+- next_state: ``(steps, num_envs, state_dim)``; PhysX output state after ``env.step``
+- action: ``(steps, num_envs, action_dim)``; exact joint action handed to Isaac Lab
+- contact: ``(steps, num_envs, contact_dim)``; post-step contact sensor labels
+- extension: zero-width by default; reward is stored only as a diagnostic label
+- termination: zero-width by default; done is stored only as a diagnostic label
 """
 
 from __future__ import annotations
@@ -44,10 +45,14 @@ from gear_sonic.utils.obs_utils import get_group_term_obs_shape
 register_rl_resolvers()
 
 
-_STATE_SPECS = (
-    ("root_lin_vel", ("root_lin_vel_b", "root_lin_vel_w"), 3),
-    ("root_ang_vel", ("root_ang_vel_b", "root_ang_vel_w"), 3),
-    ("projected_gravity", ("projected_gravity_b",), 3),
+_PHYSX_STATE_SPECS = (
+    ("root_pos_w", ("root_pos_w",), 3),
+    ("root_quat_w", ("root_quat_w",), 4),
+    ("root_lin_vel_w", ("root_lin_vel_w",), 3),
+    ("root_ang_vel_w", ("root_ang_vel_w",), 3),
+    ("root_lin_vel_b", ("root_lin_vel_b",), 3),
+    ("root_ang_vel_b", ("root_ang_vel_b",), 3),
+    ("projected_gravity_b", ("projected_gravity_b",), 3),
     ("joint_pos", ("joint_pos",), None),
     ("joint_vel", ("joint_vel",), None),
     ("body_pos_w", ("body_pos_w",), None),
@@ -184,62 +189,91 @@ def _tensor_or_zeros(record: dict[str, Any], names: tuple[str, ...], steps: int,
     return torch.zeros(steps, num_envs, dim), f"missing_zero_fallback:{names[0]}"
 
 
+def _flatten_physx_state(record: dict[str, Any], steps: int, num_envs: int):
+    parts = []
+    terms = []
+    for out_name, candidates, fallback_dim in _PHYSX_STATE_SPECS:
+        tensor, source = _tensor_or_zeros(record, candidates, steps, num_envs, fallback_dim)
+        if tensor is not None:
+            parts.append(tensor)
+            terms.append({"name": out_name, "source": source, "dim": tensor.shape[-1]})
+    if not parts:
+        raise ValueError("Cannot build PhysX RWM-U state: no robot_state tensors were exported")
+    return torch.cat(parts, dim=-1), terms
+
+
+def _extract_action_to_sim(env: Any, fallback: torch.Tensor) -> torch.Tensor:
+    for candidate in (env, getattr(env, "env", None), getattr(env, "unwrapped", None)):
+        value = getattr(candidate, "_last_env_actions_to_sim", None)
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+    return fallback.detach().cpu()
+
+
 def _build_rwmu_groups(payload: dict[str, Any]) -> dict[str, Any]:
     steps = int(payload["steps"])
     num_envs = int(payload["num_envs"])
     robot_state = payload.get("robot_state", {})
-    obs = payload.get("obs", {})
-    state_parts = []
-    state_terms = []
-    for out_name, candidates, fallback_dim in _STATE_SPECS:
-        tensor, source = _tensor_or_zeros(robot_state, candidates, steps, num_envs, fallback_dim)
-        if tensor is not None:
-            state_parts.append(tensor)
-            state_terms.append({"name": out_name, "source": source, "dim": tensor.shape[-1]})
+    next_robot_state = payload.get("next_robot_state", {})
 
-    state_source = "robot_state"
-    if not state_parts:
-        actor_obs = obs.get("actor_obs")
-        if not isinstance(actor_obs, torch.Tensor):
-            raise ValueError("Cannot build RWM-U state: no robot_state tensors and no actor_obs fallback")
-        state_parts = [actor_obs.reshape(steps, num_envs, -1).float()]
-        state_terms = [{"name": "actor_obs_fallback", "source": "obs.actor_obs", "dim": state_parts[0].shape[-1]}]
-        state_source = "actor_obs_fallback"
+    state, state_terms = _flatten_physx_state(robot_state, steps, num_envs)
+    next_state, next_state_terms = _flatten_physx_state(next_robot_state, steps, num_envs)
+    if state.shape[-1] != next_state.shape[-1]:
+        raise ValueError(f"state_dim={state.shape[-1]} does not match next_state_dim={next_state.shape[-1]}")
 
-    state = torch.cat(state_parts, dim=-1)
-    action = payload["actions"].reshape(steps, num_envs, -1).float()
-    rewards = payload["rewards"].float()
-    if rewards.dim() == 2:
-        rewards = rewards.unsqueeze(-1)
-    elif rewards.dim() > 3:
-        rewards = rewards.reshape(steps, num_envs, -1)
-    extension = rewards[..., :1]
+    action = payload.get("env_actions_to_sim", payload["actions"]).reshape(steps, num_envs, -1).float()
+
     contact_terms = []
-    contact_force = robot_state.get("contact_forces_net_forces_w")
+    contact_force = next_robot_state.get("contact_forces_net_forces_w")
     if isinstance(contact_force, torch.Tensor):
         force = contact_force.reshape(steps, num_envs, -1, 3).float()
         contact = (torch.linalg.norm(force, dim=-1) > 1.0).float()
-        contact_terms.append({"name": "contact_forces", "source": "robot_state.contact_forces_net_forces_w", "dim": contact.shape[-1]})
+        contact_terms.append({
+            "name": "contact_forces",
+            "source": "next_robot_state.contact_forces_net_forces_w",
+            "dim": contact.shape[-1],
+        })
     else:
         contact = torch.zeros(steps, num_envs, 0, dtype=torch.float32)
-    termination = (payload["dones"].bool() & ~payload["time_outs"].bool()).float()
-    if termination.dim() == 2:
-        termination = termination.unsqueeze(-1)
+
+    reward = payload["rewards"].float()
+    if reward.dim() == 2:
+        reward = reward.unsqueeze(-1)
+    elif reward.dim() > 3:
+        reward = reward.reshape(steps, num_envs, -1)
+    done_excluding_timeout = (payload["dones"].bool() & ~payload["time_outs"].bool()).float()
+    if done_excluding_timeout.dim() == 2:
+        done_excluding_timeout = done_excluding_timeout.unsqueeze(-1)
+
+    extension = torch.zeros(steps, num_envs, 0, dtype=torch.float32)
+    termination = torch.zeros(steps, num_envs, 0, dtype=torch.float32)
 
     return {
         "state": state,
+        "next_state": next_state,
         "action": action,
         "extension": extension,
         "contact": contact,
         "termination": termination,
+        "diagnostics": {
+            "reward_total": reward[..., :1],
+            "done_excluding_timeout": done_excluding_timeout,
+        },
         "schema": {
-            "name": "sonic-rwmu-clean-v1",
-            "state_source": state_source,
+            "name": "sonic-rwmu-physx-v1",
+            "contract": "RWM-U learns Isaac/PhysX transition only: physics_state_t + env_action_t -> physics_state_t_plus_1 and contact_t_plus_1. Reward/done stay diagnostics for SONIC manager parity checks.",
+            "state_source": "robot_state_before_step",
+            "next_state_source": "robot_state_after_step",
             "state_terms": state_terms,
-            "action_terms": [{"name": "policy_action", "dim": action.shape[-1]}],
-            "extension_terms": [{"name": "reward_total", "dim": extension.shape[-1]}],
+            "next_state_terms": next_state_terms,
+            "action_terms": [{"name": "isaac_joint_position_action", "source": "ManagerEnvWrapper._last_env_actions_to_sim", "dim": action.shape[-1]}],
+            "extension_terms": [],
             "contact_terms": contact_terms,
-            "termination_terms": [{"name": "done_excluding_timeout", "dim": termination.shape[-1]}],
+            "termination_terms": [],
+            "diagnostic_terms": [
+                {"name": "reward_total", "source": "Isaac reward_manager output", "dim": reward[..., :1].shape[-1]},
+                {"name": "done_excluding_timeout", "source": "terminated_or_truncated minus timeout", "dim": done_excluding_timeout.shape[-1]},
+            ],
         },
     }
 
@@ -276,6 +310,7 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
             "obs": [],
             "next_obs": [],
             "actions": [],
+            "env_actions_to_sim": [],
             "action_mean": [],
             "action_std": [],
             "rewards": [],
@@ -283,6 +318,7 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
             "time_outs": [],
             "to_log": [],
             "robot_state": [],
+            "next_robot_state": [],
             "motion_state": [],
             "policy_index": [],
         }
@@ -313,7 +349,9 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
             records["motion_state"].append(_extract_motion_state(env))
             next_obs, rewards, dones, infos = env.step(policy_state_dict)
             records["next_obs"].append(_flatten_obs_value(next_obs))
+            records["next_robot_state"].append(_extract_robot_state(env))
             records["actions"].append(policy_state_dict["actions"].detach().cpu())
+            records["env_actions_to_sim"].append(_extract_action_to_sim(env, policy_state_dict["actions"]))
             records["action_mean"].append(_flatten_obs_value(policy_state_dict.get("action_mean", policy_state_dict["actions"])))
             records["action_std"].append(_flatten_obs_value(policy_state_dict.get("action_sigma", torch.zeros_like(policy_state_dict["actions"]))))
             records["rewards"].append(rewards.detach().cpu())
@@ -337,6 +375,7 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
             "obs": _stack_time(records["obs"]),
             "next_obs": _stack_time(records["next_obs"]),
             "actions": torch.stack(records["actions"], dim=0),
+            "env_actions_to_sim": torch.stack(records["env_actions_to_sim"], dim=0),
             "action_mean": torch.stack(records["action_mean"], dim=0),
             "action_std": torch.stack(records["action_std"], dim=0),
             "rewards": torch.stack(records["rewards"], dim=0),
@@ -344,6 +383,7 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
             "time_outs": torch.stack(records["time_outs"], dim=0),
             "to_log": _stack_time(records["to_log"]),
             "robot_state": _stack_time(records["robot_state"]),
+            "next_robot_state": _stack_time(records["next_robot_state"]),
             "motion_state": _stack_time(records["motion_state"]),
             "policy_index": torch.stack(records["policy_index"], dim=0),
             "config": OmegaConf.to_container(config, resolve=False),
@@ -387,8 +427,8 @@ def main() -> None:
     rwm = payload["rwm_u"]
     print(
         f"saved {payload['steps']} steps x {payload['num_envs']} envs to {args.output}\n"
-        f"rwm_u: state={tuple(rwm['state'].shape)} action={tuple(rwm['action'].shape)} "
-        f"extension={tuple(rwm['extension'].shape)} contact={tuple(rwm['contact'].shape)} "
+        f"rwm_u: state={tuple(rwm['state'].shape)} next_state={tuple(rwm['next_state'].shape)} "
+        f"action={tuple(rwm['action'].shape)} extension={tuple(rwm['extension'].shape)} contact={tuple(rwm['contact'].shape)} "
         f"termination={tuple(rwm['termination'].shape)}"
     )
 

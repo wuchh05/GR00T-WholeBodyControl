@@ -138,6 +138,46 @@ model quality: train on real SONIC/Isaac rollouts, validate holdout n-step error
 and only then use the backend for meaningful fine-tuning.
 
 
+## Isaac/PhysX-Only RWM-U Contract
+
+The RWM-U dataset now separates the physics model from the SONIC MDP managers.
+RWM-U learns only this transition:
+
+```text
+physics_state_t + isaac_joint_position_action_t -> physics_state_t_plus_1 + contact_t_plus_1
+```
+
+Reward, done, observations, tokenizer future reference, proprio history, motion
+time cursor, and adaptive sampling remain SONIC/Isaac manager logic. The exporter
+still stores Isaac reward/done as diagnostics so parity can be checked, but they
+are not RWM-U primary training targets.
+
+Code sources:
+
+- Policy experiment and future reference settings: `gear_sonic/config/exp/manager/universal_token/all_modes/sonic_release.yaml`.
+- Isaac action term: `gear_sonic/config/manager_env/actions/terms/joint_pos.yaml`, a `JointPositionActionCfg` over all robot joints.
+- Wrapper action boundary: `gear_sonic/envs/wrapper/manager_env_wrapper.py`; `_last_env_actions_to_sim` is the exact decoded/clipped 29-D action handed to `self.env.step(env_actions)`.
+- Motion reset/reference sampling: `gear_sonic/envs/manager_env/mdp/commands.py`; `_resample_command` samples `motion_ids` and `motion_start_time_steps`, reads motion-lib root/body/joint state, applies reset randomization/clipping, then writes root/joint state to Isaac.
+- Physics fields exported before and after step: `gear_sonic/scripts/export_rwmu_transitions.py` reads `scene["robot"].data`; `gear_sonic/scripts/collect_sonic_rwmu_dataset.py` flattens those fields into `rwm_u.state` and `rwm_u.next_state`.
+
+Current flattened physics state terms are:
+
+```text
+root_pos_w, root_quat_w, root_lin_vel_w, root_ang_vel_w,
+root_lin_vel_b, root_ang_vel_b, projected_gravity_b,
+joint_pos, joint_vel,
+body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w
+```
+
+For the SONIC G1 release shape this is expected to be 262 dimensions when all
+14 tracked body tensors are present: root fields 22 + joint fields 58 + body
+fields 182. The action is expected to be 29 dimensions.
+
+Sampling remains rollout-based because Isaac needs a valid simulator state before
+each transition. Training/validation can treat every exported row as an
+independent transition sample `(s_t, a_t, s_t+1)`, while n-step evaluation uses
+consecutive rows from the same rollout to measure accumulated model error.
+
 ## 6. SONIC Policy Rollout Export And Dynamics Smoke
 
 Collect rollout data with one or more SONIC policy checkpoints. Repeat
