@@ -72,19 +72,24 @@ def _base_overrides(args: argparse.Namespace, manifest: dict[str, Any]) -> list[
 def _task_specs(args: argparse.Namespace, policies: list[Path]) -> list[dict[str, Any]]:
     tasks = []
     for source in args.action_source:
-        if source == "random":
-            tasks.append({"action_source": "random", "stochastic": False, "policy": None, "tag": "random"})
-        elif source == "zeros":
-            tasks.append({"action_source": "zeros", "stochastic": False, "policy": None, "tag": "zeros"})
-        elif source in {"policy_mean", "policy_stochastic"}:
+        if source in {"random", "zeros", "sine"}:
+            tasks.append({
+                "action_source": source,
+                "deterministic_policy_action": False,
+                "policy": None,
+                "tag": source,
+            })
+        elif source in {"policy", "policy_mean", "policy_stochastic"}:
             if not policies:
                 raise ValueError(f"{source} requires --policy or --policy-list")
+            deterministic = source == "policy_mean"
+            normalized_source = "policy"
             for policy in policies:
                 tag = policy.parent.name if policy.name == "last.pt" else policy.stem
                 tasks.append(
                     {
-                        "action_source": "policy",
-                        "stochastic": source == "policy_stochastic",
+                        "action_source": normalized_source,
+                        "deterministic_policy_action": deterministic,
                         "policy": str(policy),
                         "tag": f"{tag}_{source}",
                     }
@@ -129,8 +134,8 @@ def run_plan(args: argparse.Namespace) -> dict[str, Any]:
         ]
         if task["policy"] is not None:
             cmd.extend(["--checkpoint", task["policy"]])
-        if task["stochastic"]:
-            cmd.append("--stochastic")
+        if task.get("deterministic_policy_action"):
+            cmd.append("--deterministic-policy-action")
         cmd.append("--")
         cmd.extend(base_overrides)
         entry: dict[str, Any] = {"index": idx, "output": str(out), "task": task, "collect_cmd": cmd}
@@ -171,9 +176,9 @@ def main() -> None:
     parser.add_argument(
         "--action-source",
         action="append",
-        choices=["policy_mean", "policy_stochastic", "random", "zeros"],
+        choices=["policy", "policy_mean", "policy_stochastic", "random", "zeros", "sine"],
         default=[],
-        help="Repeat to include multiple data sources. Defaults to policy_mean and random.",
+        help="Repeat to include multiple data sources. Defaults to policy and random. policy_mean uses deterministic action_mean; policy_stochastic is a compatibility alias for policy.",
     )
     parser.add_argument("--sim-preset", choices=["isaac", "rwm-smoke"], default="isaac")
     parser.add_argument("--steps", type=int, default=512)
@@ -185,7 +190,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if not args.action_source:
-        args.action_source = ["policy_mean", "random"]
+        args.action_source = ["policy", "random"]
     ledger = run_plan(args)
     print(json.dumps(ledger.get("summary", {}), indent=2))
 

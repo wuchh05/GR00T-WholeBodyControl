@@ -19,6 +19,53 @@ def _shape(value: Any):
     return tuple(value.shape) if isinstance(value, torch.Tensor) else None
 
 
+def _schema_term_dim(schema: dict[str, Any], name: str) -> int | None:
+    for term in schema.get("state_terms", []):
+        if term.get("name") == name:
+            return int(term["dim"])
+    return None
+
+
+def _check_schema_dimensions(rwm: dict[str, Any]) -> None:
+    schema = rwm["schema"]
+    if "state_dim" in schema and schema["state_dim"] is not None:
+        if int(schema["state_dim"]) != int(rwm["state"].shape[-1]):
+            raise ValueError("schema.state_dim does not match rwm_u.state")
+    if "next_state_dim" in schema and schema["next_state_dim"] is not None:
+        if int(schema["next_state_dim"]) != int(rwm["next_state"].shape[-1]):
+            raise ValueError("schema.next_state_dim does not match rwm_u.next_state")
+    if "action_dim" in schema and schema["action_dim"] is not None:
+        if int(schema["action_dim"]) != int(rwm["action"].shape[-1]):
+            raise ValueError("schema.action_dim does not match rwm_u.action")
+    if "contact_dim" in schema and schema["contact_dim"] is not None:
+        if int(schema["contact_dim"]) != int(rwm["contact"].shape[-1]):
+            raise ValueError("schema.contact_dim does not match rwm_u.contact")
+
+    num_joints = schema.get("num_joints")
+    if num_joints is not None:
+        for name in ("joint_pos", "joint_vel"):
+            dim = _schema_term_dim(schema, name)
+            if dim is not None and dim != int(num_joints):
+                raise ValueError(f"{name} dim={dim} does not match schema.num_joints={num_joints}")
+
+    num_bodies = schema.get("num_robot_bodies")
+    if num_bodies is not None:
+        expected = {
+            "body_pos_w": int(num_bodies) * 3,
+            "body_quat_w": int(num_bodies) * 4,
+            "body_lin_vel_w": int(num_bodies) * 3,
+            "body_ang_vel_w": int(num_bodies) * 3,
+        }
+        for name, expected_dim in expected.items():
+            dim = _schema_term_dim(schema, name)
+            if dim is not None and dim != expected_dim:
+                raise ValueError(f"{name} dim={dim} does not match {num_bodies} robot bodies")
+
+    contact_names = schema.get("contact_body_names") or []
+    if contact_names and len(contact_names) != int(rwm["contact"].shape[-1]):
+        raise ValueError("schema.contact_body_names length does not match rwm_u.contact dim")
+
+
 def validate(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     missing = [key for key in REQUIRED_TOP_LEVEL if key not in payload]
@@ -44,6 +91,7 @@ def validate(path: Path) -> dict[str, Any]:
 
     if rwm["state"].shape[-1] != rwm["next_state"].shape[-1]:
         raise ValueError("rwm_u.state and rwm_u.next_state dims must match")
+    _check_schema_dimensions(rwm)
     action_source = payload.get("env_actions_to_sim", payload["actions"])
     if rwm["action"].shape[-1] != action_source.reshape(steps, num_envs, -1).shape[-1]:
         raise ValueError("rwm_u.action dim does not match env_actions_to_sim/raw actions")
@@ -70,8 +118,21 @@ def validate(path: Path) -> dict[str, Any]:
         "extension_shape": _shape(rwm["extension"]),
         "contact_shape": _shape(rwm["contact"]),
         "termination_shape": _shape(rwm["termination"]),
+        "schema_name": rwm["schema"].get("name"),
         "state_source": rwm["schema"].get("state_source"),
         "next_state_source": rwm["schema"].get("next_state_source"),
+        "dimension_policy": rwm["schema"].get("dimension_policy"),
+        "schema_state_dim": rwm["schema"].get("state_dim"),
+        "schema_action_dim": rwm["schema"].get("action_dim"),
+        "schema_contact_dim": rwm["schema"].get("contact_dim"),
+        "num_joints": rwm["schema"].get("num_joints"),
+        "num_robot_bodies": rwm["schema"].get("num_robot_bodies"),
+        "num_contact_bodies": rwm["schema"].get("num_contact_bodies"),
+        "joint_names": rwm["schema"].get("joint_names", []),
+        "robot_body_names": rwm["schema"].get("robot_body_names", []),
+        "contact_body_names": rwm["schema"].get("contact_body_names", []),
+        "state_dim_formula": rwm["schema"].get("state_dim_formula"),
+        "state_dim_formula_terms": rwm["schema"].get("state_dim_formula_terms", {}),
         "state_terms": state_terms,
         "next_state_terms": rwm["schema"].get("next_state_terms", []),
         "missing_fallback_terms": missing_fallback_terms,

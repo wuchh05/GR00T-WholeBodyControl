@@ -181,6 +181,10 @@ def _load_policy(config: DictConfig, env, checkpoint_path: Path, device: str):
     if missing or unexpected:
         print(f"[policy load] {checkpoint_path}: missing={len(missing)} unexpected={len(unexpected)}")
     policy.eval()
+    if hasattr(policy, "mode"):
+        policy.mode = "train_rollout"
+    if hasattr(policy, "transform_eval"):
+        policy.transform_eval()
     policy.init_rollout()
     return policy
 
@@ -195,6 +199,15 @@ def _tensor_or_zeros(record: dict[str, Any], names: tuple[str, ...], steps: int,
     return torch.zeros(steps, num_envs, dim), f"missing_zero_fallback:{names[0]}"
 
 
+def _raw_term_shape(record: dict[str, Any], source: str | None) -> list[int]:
+    if source is None or source.startswith("missing_zero_fallback:"):
+        return []
+    value = record.get(source)
+    if isinstance(value, torch.Tensor) and value.dim() >= 2:
+        return [int(dim) for dim in value.shape[2:]]
+    return []
+
+
 def _flatten_physx_state(record: dict[str, Any], steps: int, num_envs: int):
     parts = []
     terms = []
@@ -202,10 +215,34 @@ def _flatten_physx_state(record: dict[str, Any], steps: int, num_envs: int):
         tensor, source = _tensor_or_zeros(record, candidates, steps, num_envs, fallback_dim)
         if tensor is not None:
             parts.append(tensor)
-            terms.append({"name": out_name, "source": source, "dim": tensor.shape[-1]})
+            term = {"name": out_name, "source": source, "dim": int(tensor.shape[-1])}
+            raw_shape = _raw_term_shape(record, source)
+            if raw_shape:
+                term["raw_shape_after_steps_envs"] = raw_shape
+            terms.append(term)
     if not parts:
         raise ValueError("Cannot build PhysX RWM-U state: no robot_state tensors were exported")
     return torch.cat(parts, dim=-1), terms
+
+
+def _first_list_value(record: dict[str, Any], key: str) -> list[str]:
+    value = record.get(key)
+    if isinstance(value, list) and value:
+        first = value[0]
+        if isinstance(first, (list, tuple)):
+            return [str(item) for item in first]
+        if all(isinstance(item, str) for item in value):
+            return [str(item) for item in value]
+    if isinstance(value, tuple):
+        return [str(item) for item in value]
+    return []
+
+
+def _term_dim(terms: list[dict[str, Any]], name: str) -> int | None:
+    for term in terms:
+        if term.get("name") == name:
+            return int(term["dim"])
+    return None
 
 
 def _extract_action_to_sim(env: Any, fallback: torch.Tensor) -> torch.Tensor:
@@ -229,6 +266,51 @@ def _get_action_dim(env: Any) -> int:
         if isinstance(action, torch.Tensor) and action.dim() >= 2:
             return int(action.shape[-1])
     return int(env.action_space.shape[-1])
+
+
+def _has_action_transform(env: Any) -> bool:
+    for candidate in (env, getattr(env, "env", None), getattr(env, "unwrapped", None)):
+        if getattr(candidate, "action_transform_module", None) is not None:
+            return True
+    return False
+
+
+def _normalize_step_actions(actions: torch.Tensor, num_envs: int, action_dim: int) -> torch.Tensor:
+    if actions.dim() == 3 and actions.shape[1] == 1:
+        actions = actions[:, -1]
+    if actions.dim() == 1:
+        actions = actions.unsqueeze(0)
+    expected = (num_envs, action_dim)
+    if tuple(actions.shape) != expected:
+        raise ValueError(f"policy actions must have shape {expected}, got {tuple(actions.shape)}")
+    return actions.detach().float().contiguous()
+
+
+def _postprocess_policy_actions(actions: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    if args.policy_action_scale != 1.0:
+        actions = actions * float(args.policy_action_scale)
+    if args.policy_action_clip is not None:
+        clip = float(args.policy_action_clip)
+        actions = torch.clamp(actions, -clip, clip)
+    return actions.detach().float().contiguous()
+
+
+def _build_env_step_input(
+    env: Any,
+    policy_state_dict: dict[str, Any],
+    obs: dict[str, Any],
+    num_envs: int,
+    action_dim: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    actions = _normalize_step_actions(policy_state_dict["actions"], num_envs, action_dim)
+    actions = _postprocess_policy_actions(actions, args)
+    if _has_action_transform(env):
+        out = dict(policy_state_dict)
+        out["actions"] = actions
+        out.setdefault("obs_dict", obs)
+        return out
+    return {"actions": actions}
 
 
 def _build_rwmu_groups(payload: dict[str, Any]) -> dict[str, Any]:
@@ -256,6 +338,22 @@ def _build_rwmu_groups(payload: dict[str, Any]) -> dict[str, Any]:
         })
     else:
         contact = torch.zeros(steps, num_envs, 0, dtype=torch.float32)
+
+    joint_names = _first_list_value(robot_state, "joint_names") or _first_list_value(next_robot_state, "joint_names")
+    body_names = _first_list_value(robot_state, "body_names") or _first_list_value(next_robot_state, "body_names")
+    contact_body_names = (
+        _first_list_value(robot_state, "contact_body_names")
+        or _first_list_value(next_robot_state, "contact_body_names")
+    )
+    state_formula_terms = {
+        "root_scalar_terms": 22,
+        "joint_pos": _term_dim(state_terms, "joint_pos"),
+        "joint_vel": _term_dim(state_terms, "joint_vel"),
+        "body_pos_w": _term_dim(state_terms, "body_pos_w"),
+        "body_quat_w": _term_dim(state_terms, "body_quat_w"),
+        "body_lin_vel_w": _term_dim(state_terms, "body_lin_vel_w"),
+        "body_ang_vel_w": _term_dim(state_terms, "body_ang_vel_w"),
+    }
 
     reward = payload["rewards"].float()
     if reward.dim() == 2:
@@ -285,6 +383,19 @@ def _build_rwmu_groups(payload: dict[str, Any]) -> dict[str, Any]:
             "contract": "RWM-U learns Isaac/PhysX transition only: physics_state_t + env_action_t -> physics_state_t_plus_1 and contact_t_plus_1. Reward/done stay diagnostics for SONIC manager parity checks.",
             "state_source": "robot_state_before_step",
             "next_state_source": "robot_state_after_step",
+            "dimension_policy": "derived_from_isaac_robot_data_fields; no hard-coded state_dim",
+            "state_dim": int(state.shape[-1]),
+            "next_state_dim": int(next_state.shape[-1]),
+            "action_dim": int(action.shape[-1]),
+            "contact_dim": int(contact.shape[-1]),
+            "num_joints": len(joint_names) if joint_names else None,
+            "num_robot_bodies": len(body_names) if body_names else None,
+            "num_contact_bodies": len(contact_body_names) if contact_body_names else int(contact.shape[-1]),
+            "joint_names": joint_names,
+            "robot_body_names": body_names,
+            "contact_body_names": contact_body_names,
+            "state_dim_formula": "22 + joint_pos_dim + joint_vel_dim + body_pos_w_dim + body_quat_w_dim + body_lin_vel_w_dim + body_ang_vel_w_dim",
+            "state_dim_formula_terms": state_formula_terms,
             "state_terms": state_terms,
             "next_state_terms": next_state_terms,
             "action_terms": [{"name": "isaac_joint_position_action", "source": "ManagerEnvWrapper._last_env_actions_to_sim", "dim": action.shape[-1]}],
@@ -363,12 +474,18 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
             elif args.action_source == "random":
                 policy_state_dict = {"actions": torch.randn(num_envs, action_dim, device=env.device)}
                 selected_policy = -1
+            elif args.action_source == "sine":
+                phase = torch.linspace(0.0, 3.14159265, action_dim, device=env.device).unsqueeze(0)
+                env_phase = torch.arange(num_envs, device=env.device, dtype=torch.float32).unsqueeze(1) * 0.17
+                step_phase = float(step) * 0.37
+                policy_state_dict = {"actions": 0.5 * torch.sin(phase + env_phase + step_phase)}
+                selected_policy = -1
             else:
                 policy_outputs = []
                 with torch.no_grad():
                     for policy in policies:
                         out = policy.rollout(obs_dict=obs.copy(), cur_dones=dones_for_policy)
-                        if not args.stochastic:
+                        if args.deterministic_policy_action:
                             out["actions"] = out["action_mean"]
                         policy_outputs.append(out)
                 if args.policy_selection == "random_step":
@@ -389,13 +506,25 @@ def collect(config: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
                 _debug(f"step {step} extract motion_state done")
             else:
                 records["motion_state"].append({})
-            _debug(f"step {step} env.step begin")
-            next_obs, rewards, dones, infos = env.step(policy_state_dict)
+            step_input = _build_env_step_input(env, policy_state_dict, obs, num_envs, action_dim, args)
+            step_actions = step_input["actions"]
+            finite = bool(torch.isfinite(step_actions).all().detach().cpu())
+            action_min = float(step_actions.detach().min().cpu())
+            action_max = float(step_actions.detach().max().cpu())
+            action_mean_abs = float(step_actions.detach().abs().mean().cpu())
+            _debug(
+                f"step {step} env.step begin action_shape={tuple(step_actions.shape)} "
+                f"action_transform={_has_action_transform(env)} finite={finite} "
+                f"min={action_min:.6f} max={action_max:.6f} mean_abs={action_mean_abs:.6f}"
+            )
+            if not finite:
+                raise ValueError("policy produced non-finite actions")
+            next_obs, rewards, dones, infos = env.step(step_input)
             _debug(f"step {step} env.step done")
             records["next_obs"].append(_flatten_obs_value(next_obs))
             records["next_robot_state"].append(_extract_robot_state(env))
-            records["actions"].append(policy_state_dict["actions"].detach().cpu())
-            records["env_actions_to_sim"].append(_extract_action_to_sim(env, policy_state_dict["actions"]))
+            records["actions"].append(step_input["actions"].detach().cpu())
+            records["env_actions_to_sim"].append(_extract_action_to_sim(env, step_input["actions"]))
             records["action_mean"].append(_flatten_obs_value(policy_state_dict.get("action_mean", policy_state_dict["actions"])))
             records["action_std"].append(_flatten_obs_value(policy_state_dict.get("action_sigma", torch.zeros_like(policy_state_dict["actions"]))))
             records["rewards"].append(rewards.detach().cpu())
@@ -451,11 +580,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=64)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--action-source", choices=["policy", "random", "zeros"], default="policy")
+    parser.add_argument("--action-source", choices=["policy", "random", "zeros", "sine"], default="policy")
     parser.add_argument("--checkpoint", action="append", default=[], help="Policy checkpoint path. Repeat for diverse policies.")
     parser.add_argument("--checkpoint-list", type=Path, default=None, help="Text file with one checkpoint path per line.")
     parser.add_argument("--policy-selection", choices=["step_cycle", "random_step"], default="step_cycle")
-    parser.add_argument("--stochastic", action="store_true", help="Sample stochastic policy actions instead of action_mean.")
+    parser.add_argument("--stochastic", action="store_true", help="Deprecated compatibility flag; policy sampling now matches SONIC training and uses sampled actions by default.")
+    parser.add_argument("--deterministic-policy-action", action="store_true", help="Use action_mean instead of sampled policy actions. This is not the original SONIC training rollout behavior.")
+    parser.add_argument("--policy-action-scale", type=float, default=1.0, help="Scale policy actions before env.step; useful for safe Isaac data collection diagnostics.")
+    parser.add_argument("--policy-action-clip", type=float, default=None, help="Optional symmetric policy action clamp before env.step.")
     parser.add_argument("--record-motion-state", action="store_true", help="Also export motion command internals; disabled by default because PhysX-only RWM-U does not train on them.")
     parser.add_argument("overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()

@@ -114,9 +114,13 @@ current robot state | action applied | reward/extra labels | contact labels | fa
 For the upstream ANYmal-D smoke data, one row is 45 state numbers, 12 action
 numbers, 0 extension numbers, 8 contact numbers, and 1 termination number.
 
-For SONIC, the row is wider. Example: `joint_pos` has 29 numbers because the
-release policy controls 29 body joints; `body_pos_w` has `14 x 3` numbers because
-SONIC tracks 14 body links and each link has xyz world position.
+For SONIC, the row is wider and the exact width is derived from the Isaac
+`scene["robot"].data` tensors in the environment that produced the dataset.
+Example: `joint_pos` has 29 numbers because the release policy controls 29
+joints. In the real G1 Isaac release smoke, `body_pos_w` has `30 x 3` numbers
+because Isaac exposes 30 robot bodies; the 14-body list used by SONIC tracking
+rewards is a reference/tracking subset, not the full PhysX state exported for
+RWM-U.
 
 Do not train RWM-U to predict noisy `actor_obs` directly. RWM-U should predict
 clean robot state/contact/failure. The SONIC adapter then rebuilds `actor_obs`,
@@ -170,9 +174,22 @@ body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w
 ```
 
 For the real SONIC G1 release Isaac env, validation currently reports 470
-physics-state dimensions: root fields 22 + joint fields 58 + 30 robot bodies
-with position/quaternion/linear-velocity/angular-velocity fields. The action is
-29 dimensions, matching the Isaac Lab `joint_pos` action term.
+physics-state dimensions:
+
+```text
+state_dim = 22 root/gravity terms
+          + 29 joint_pos + 29 joint_vel
+          + 30 * (3 body_pos_w + 4 body_quat_w + 3 body_lin_vel_w + 3 body_ang_vel_w)
+          = 470
+```
+
+The action is 29 dimensions, matching the Isaac Lab `joint_pos` action term.
+The older 262-D number was only a synthetic/early estimate based on a smaller
+tracked-body subset; it is not the canonical Isaac/PhysX export schema. The
+current exporter writes `state_dim`, `action_dim`, `contact_dim`, joint names,
+robot body names, contact body names, and per-term raw shapes into
+`rwm_u.schema`, so every dataset can be checked against the Isaac fields that
+actually generated it.
 
 `collect_sonic_rwmu_dataset.py` deliberately skips `motion_state` by default.
 RWM-U does not train on future motion/reference internals, and some command
@@ -200,6 +217,14 @@ consecutive rows from the same rollout to measure accumulated model error.
 
 Collect rollout data with one or more SONIC policy checkpoints. Repeat
 `--checkpoint` or pass `--checkpoint-list` to mix policies for data diversity.
+For `--action-source policy`, the exporter follows the original PPO rollout path:
+`policy.rollout(... )["actions"]` is passed to `env.step(...)`. This is the
+sampled training action, not deterministic `action_mean`. Use
+`--deterministic-policy-action` only when you intentionally want `action_mean`.
+For low-risk plumbing checks, the exporter also supports deterministic/control
+action sources: `zeros`, `random`, and `sine`. These still step the real Isaac
+environment when used with the Isaac release config, so they produce valid
+`state/action/next_state/contact` rows for schema and training smoke tests.
 The smoke command below uses the RWM placeholder environment only to verify the
 policy sampling and dataset format path:
 
@@ -221,6 +246,14 @@ Validate the exported RWM-U tensors:
 python gear_sonic/scripts/validate_sonic_rwmu_dataset.py \
   /tmp/sonic_rwmu_policy_smoke.pt --json
 ```
+
+A real-Isaac local smoke was run with `zeros`, `random`, `sine`, and release
+`policy` action sources on a 6-motion subset. Each dataset validated as
+`state=(2, 1, 470)`, `next_state=(2, 1, 470)`, `action=(2, 1, 29)`,
+`contact=(2, 1, 30)`, `extension=(2, 1, 0)`, and `termination=(2, 1, 0)`.
+The policy smoke loaded `sonic_release/last.pt` and completed Isaac steps with
+finite sampled `(1, 29)` actions. A deterministic `action_mean` probe can be
+more brittle in this local Isaac setup and is not the default training path.
 
 Train a minimal SONIC RWM-U dynamics checkpoint from the exported data:
 
@@ -247,8 +280,8 @@ claims.
 
 ## 7. Current End-To-End Smoke Result
 
-The following smoke chain has been verified locally with 12 steps and 2 parallel
-environments:
+The no-Isaac RWM plumbing smoke below has been verified locally with 12 steps
+and 2 parallel environments:
 
 ```bash
 python gear_sonic/scripts/collect_sonic_rwmu_dataset.py \
@@ -298,6 +331,53 @@ The final training smoke logged `Env/rwm/reward`, `Env/rwm/aleatoric`, and
 `Env/rwm/epistemic`, confirming that policy training used the loaded RWM-U
 checkpoint path rather than the placeholder smoke reward.
 
+The real-Isaac field and policy-sampling smoke below was also verified locally
+on a 6-motion subset:
+
+```bash
+python gear_sonic/scripts/collect_sonic_rwmu_dataset.py \
+  --output /tmp/sonic_rwmu_three_policy_smoke/policy_sampled.pt \
+  --steps 2 \
+  --device cuda \
+  --action-source policy \
+  --checkpoint sonic_release/last.pt \
+  -- +exp=manager/universal_token/all_modes/sonic_release \
+  num_envs=1 headless=True use_wandb=false \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/tmp/sonic_rwmu_three_policy_smoke/robot_subset \
+  ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=/tmp/sonic_rwmu_three_policy_smoke/smpl_subset \
+  ++manager_env.commands.motion.motion_lib_cfg.load_unique_motions=true
+
+python gear_sonic/scripts/validate_sonic_rwmu_dataset.py \
+  /tmp/sonic_rwmu_three_policy_smoke/policy_sampled.pt \
+  --json --require-physical-state --require-contact
+
+python gear_sonic/scripts/train_sonic_rwmu_dynamics.py \
+  --dataset /tmp/sonic_rwmu_three_policy_smoke/zeros.pt \
+  --dataset /tmp/sonic_rwmu_three_policy_smoke/random.pt \
+  --dataset /tmp/sonic_rwmu_three_policy_smoke/sine.pt \
+  --dataset /tmp/sonic_rwmu_three_policy_smoke/policy_sampled.pt \
+  --output /tmp/sonic_rwmu_three_policy_smoke/sonic_rwmu_dynamics_with_policy.pt \
+  --report /tmp/sonic_rwmu_three_policy_smoke/sonic_rwmu_train_report_with_policy.json \
+  --device cpu \
+  --history-horizon 1 \
+  --forecast-horizon 1 \
+  --ensemble-size 1 \
+  --hidden-size 32 \
+  --batch-size 1 \
+  --epochs 1
+
+python gear_sonic/train_agent_trl.py \
+  +exp=rwm/sonic_release \
+  +checkpoint=sonic_release/last.pt \
+  num_envs=2 headless=True use_wandb=false \
+  rwm_env.backend=rwmu \
+  +rwm_env.checkpoint=/tmp/sonic_rwmu_three_policy_smoke/sonic_rwmu_dynamics_with_policy.pt \
+  algo.config.num_steps_per_env=2 \
+  algo.config.num_learning_iterations=1 \
+  algo.config.num_learning_epochs=1 \
+  algo.config.num_mini_batches=1
+```
+
 The same smoke dataset intentionally fails strict physical-state validation:
 
 ```bash
@@ -333,9 +413,8 @@ replaced.
 
 Recommended initial mixture:
 
-- Released policy, deterministic action mean: stable nominal tracking manifold.
-- Released policy, stochastic actions: local action perturbations around the
-  nominal manifold.
+- Released policy, sampled training actions (`policy`): local action perturbations around the nominal manifold and the closest match to PPO data collection.
+- Released policy, deterministic action mean (`policy_mean`): stable nominal tracking manifold.
 - Random/noisy actions with short horizons: dynamics sensitivity and recovery
   labels, but cap episode length to avoid wasting data far outside useful states.
 - Multiple fine-tuned or intermediate checkpoints: policy-distribution diversity.
@@ -384,9 +463,10 @@ python gear_sonic/scripts/run_sonic_rwmu_sampling_plan.py \
   --output-dir /mnt/datasets/sonic_rwmu/v1_small/raw \
   --ledger /mnt/datasets/sonic_rwmu/v1_small/ledger.json \
   --policy sonic_release/last.pt \
+  --action-source policy \
   --action-source policy_mean \
-  --action-source policy_stochastic \
   --action-source random \
+  --action-source sine \
   --sim-preset isaac \
   --steps 512 \
   --num-envs 128 \
@@ -407,7 +487,7 @@ python gear_sonic/scripts/run_sonic_rwmu_sampling_plan.py \
   --output-dir /tmp/sonic_rwmu_sampling_v1_small/out_smoke \
   --ledger /tmp/sonic_rwmu_sampling_v1_small/ledger_smoke.json \
   --policy sonic_release/last.pt \
-  --action-source policy_mean \
+  --action-source policy \
   --action-source random \
   --sim-preset rwm-smoke \
   --steps 8 \
@@ -424,8 +504,8 @@ not be used for RWM-U quality training.
 For the first useful Isaac dataset, keep the run modest but diverse:
 
 - 12 to 24 selected motions from the manifest categories.
-- 3 action sources: `policy_mean`, `policy_stochastic`, and short-horizon
-  `random`.
+- 4 action sources: `policy` sampled actions, `policy_mean`, short-horizon
+  `random`, and smooth `sine`.
 - 1 to 3 policy checkpoints initially; add intermediate fine-tuned checkpoints
   later.
 - `num_envs=128` and `steps=512` per task as a first scalable check, then expand.
