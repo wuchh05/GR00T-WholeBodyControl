@@ -1,8 +1,9 @@
 """RWM/RWM-U environment adapter entrypoint for SONIC training.
 
-This module intentionally starts with a smoke-test backend. The real RWM-U
-model can be plugged in behind the same SONIC trainer contract once the exported
-SONIC transition schema and model checkpoint are available.
+The ``smoke`` backend is a deterministic tensor environment for trainer plumbing.
+The ``rwmu`` backend loads a SONIC RWM-U dynamics checkpoint produced by
+``gear_sonic/scripts/train_sonic_rwmu_dynamics.py`` and uses it as a minimal
+learned simulator behind the same SONIC trainer contract.
 """
 
 from __future__ import annotations
@@ -95,11 +96,18 @@ class RwmSonicEnvWrapper:
         self.max_episode_length = max(1, int(round(episode_length_s / self.step_dt)))
         self.reward_scale = float(config.get("smoke_reward_scale", 1.0))
 
-        if self.backend != "smoke":
-            raise NotImplementedError(
-                "Only rwm_env.backend=smoke is wired today. Train/export a SONIC RWM-U "
-                "checkpoint first, then implement the backend loader behind this wrapper."
-            )
+        self.rwmu_checkpoint_path = config.get("checkpoint", config.get("checkpoint_path", None))
+        self.rwmu_model = None
+        self.rwmu_ckpt: dict[str, Any] | None = None
+        self.rwmu_state_dim = 0
+        self.rwmu_extension_dim = 0
+        self.rwmu_contact_dim = 0
+        self.rwmu_termination_dim = 0
+        self.rwmu_history_horizon = 1
+        if self.backend not in {"smoke", "rwmu", "rwm-u", "rwm_u"}:
+            raise ValueError(f"unknown rwm_env.backend={self.backend}")
+        if self.backend in {"rwmu", "rwm-u", "rwm_u"}:
+            self._load_rwmu_backend()
 
         encoder_probs = dict(config.get("encoder_sample_probs", {"g1": 1.0, "teleop": 1.0, "smpl": 1.0}))
         self.encoder_names = tuple(encoder_probs.keys()) or ("g1", "teleop", "smpl")
@@ -141,6 +149,15 @@ class RwmSonicEnvWrapper:
         self.action_space = _ShapeOnlySpace((self.action_dim,))
 
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._rwmu_state_norm = torch.zeros(
+            self.num_envs, self.rwmu_state_dim, dtype=torch.float32, device=self.device
+        ) if self.rwmu_state_dim > 0 else None
+        self._rwmu_state_history = torch.zeros(
+            self.num_envs, self.rwmu_history_horizon, self.rwmu_state_dim, dtype=torch.float32, device=self.device
+        ) if self.rwmu_state_dim > 0 else None
+        self._rwmu_action_history = torch.zeros(
+            self.num_envs, self.rwmu_history_horizon, self.action_dim, dtype=torch.float32, device=self.device
+        ) if self.rwmu_state_dim > 0 else None
         self._actor_state = torch.zeros(
             self.num_envs, self.actor_obs_dim, dtype=torch.float32, device=self.device
         )
@@ -159,6 +176,93 @@ class RwmSonicEnvWrapper:
             self._encoder_index[:, 0] = 1.0
         self.obs_buf_dict: dict[str, torch.Tensor] = {}
         self.extras: dict[str, Any] = {}
+
+
+    def _load_rwmu_backend(self) -> None:
+        if self.rwmu_checkpoint_path is None:
+            raise ValueError("rwm_env.backend=rwmu requires rwm_env.checkpoint=/path/to/sonic_rwmu.pt")
+        import sys
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[2]
+        rsl_root = repo_root / "external_dependencies" / "rsl_rl_rwm"
+        if str(rsl_root) not in sys.path:
+            sys.path.insert(0, str(rsl_root))
+        from rsl_rl.modules import SystemDynamicsEnsemble
+
+        ckpt = torch.load(self.rwmu_checkpoint_path, map_location=self.device, weights_only=False)
+        dims = ckpt["dims"]
+        if int(dims["action_dim"]) != self.action_dim:
+            raise ValueError(
+                f"RWM-U action_dim={dims['action_dim']} does not match SONIC action_dim={self.action_dim}"
+            )
+        self.rwmu_ckpt = ckpt
+        self.rwmu_state_dim = int(dims["state_dim"])
+        self.rwmu_extension_dim = int(dims.get("extension_dim", 0))
+        self.rwmu_contact_dim = int(dims.get("contact_dim", 0))
+        self.rwmu_termination_dim = int(dims.get("termination_dim", 0))
+        self.rwmu_history_horizon = int(ckpt.get("history_horizon", 1))
+        self.rwmu_model = SystemDynamicsEnsemble(
+            state_dim=self.rwmu_state_dim,
+            action_dim=self.action_dim,
+            extension_dim=self.rwmu_extension_dim,
+            contact_dim=self.rwmu_contact_dim,
+            termination_dim=self.rwmu_termination_dim,
+            device=str(self.device),
+            ensemble_size=int(ckpt.get("ensemble_size", 1)),
+            history_horizon=self.rwmu_history_horizon,
+            architecture_config=ckpt["architecture_config"],
+        ).to(self.device)
+        self.rwmu_model.load_state_dict(ckpt["system_dynamics_state_dict"])
+        self.rwmu_model.eval()
+        self.rwmu_state_mean = ckpt["state_data_mean"].to(self.device).float()
+        self.rwmu_state_std = ckpt["state_data_std"].to(self.device).float().clamp_min(1.0e-6)
+        self.rwmu_action_mean = ckpt["action_data_mean"].to(self.device).float()
+        self.rwmu_action_std = ckpt["action_data_std"].to(self.device).float().clamp_min(1.0e-6)
+
+    def _rwmu_denormalized_state(self) -> torch.Tensor | None:
+        if self._rwmu_state_norm is None:
+            return None
+        return self._rwmu_state_norm * self.rwmu_state_std + self.rwmu_state_mean
+
+    def _sync_obs_from_rwmu_state(self) -> None:
+        state = self._rwmu_denormalized_state()
+        if state is None:
+            return
+        state_dim = min(state.shape[-1], self.actor_obs_dim)
+        self._actor_state[:, :state_dim] = state[:, :state_dim]
+        critic_dim = min(state.shape[-1], self.critic_obs_dim)
+        self._critic_state[:, :critic_dim] = state[:, :critic_dim]
+
+    @torch.no_grad()
+    def _rwmu_step(self, env_actions: torch.Tensor):
+        assert self.rwmu_model is not None
+        action_norm = (env_actions - self.rwmu_action_mean) / self.rwmu_action_std
+        if self._rwmu_state_history is None or self._rwmu_action_history is None:
+            raise RuntimeError("RWM-U histories are not initialized")
+        self._rwmu_action_history = torch.roll(self._rwmu_action_history, shifts=-1, dims=1)
+        self._rwmu_action_history[:, -1] = action_norm
+        self.rwmu_model.reset()
+        pred_state, aleatoric, epistemic, extension, contact, termination = self.rwmu_model(
+            self._rwmu_state_history, self._rwmu_action_history
+        )
+        self._rwmu_state_norm = pred_state.detach()
+        self._rwmu_state_history = torch.roll(self._rwmu_state_history, shifts=-1, dims=1)
+        self._rwmu_state_history[:, -1] = self._rwmu_state_norm
+        self._sync_obs_from_rwmu_state()
+        self._actor_state = torch.roll(self._actor_state, shifts=-self.action_dim, dims=1)
+        copy_dim = min(self.action_dim, self.actor_obs_dim)
+        self._actor_state[:, -copy_dim:] = env_actions[:, :copy_dim]
+        self._critic_state[:, : self.actor_obs_dim] = self._actor_state
+        if extension is not None and extension.shape[-1] > 0:
+            rewards = extension[:, :1]
+        else:
+            rewards = -self.reward_scale * torch.mean(env_actions.square(), dim=1, keepdim=True)
+        if termination is not None and termination.shape[-1] > 0:
+            learned_dones = (torch.sigmoid(termination[:, 0]) > 0.5)
+        else:
+            learned_dones = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        return rewards, learned_dones, aleatoric, epistemic
 
     def _build_tokenizer_dict(self) -> dict[str, torch.Tensor]:
         tokenizer = {
@@ -200,9 +304,16 @@ class RwmSonicEnvWrapper:
 
     def reset(self, flatten_dict_obs: bool = True):
         self.episode_length_buf.zero_()
+        if self._rwmu_state_norm is not None:
+            self._rwmu_state_norm.zero_()
+        if self._rwmu_state_history is not None:
+            self._rwmu_state_history.zero_()
+        if self._rwmu_action_history is not None:
+            self._rwmu_action_history.zero_()
         self._actor_state.zero_()
         self._critic_state.zero_()
         self._last_actions.zero_()
+        self._sync_obs_from_rwmu_state()
         self.extras = {
             "episode": {},
             "to_log": {},
@@ -229,35 +340,51 @@ class RwmSonicEnvWrapper:
         self.episode_length_buf += 1
 
         action_delta = env_actions - self._last_actions
-        self._actor_state = torch.roll(self._actor_state, shifts=-self.action_dim, dims=1)
-        copy_dim = min(self.action_dim, self.actor_obs_dim)
-        self._actor_state[:, -copy_dim:] = env_actions[:, :copy_dim]
-        self._critic_state[:, : self.actor_obs_dim] = self._actor_state
         self._last_actions = env_actions.detach()
-
-        rewards = -self.reward_scale * torch.mean(env_actions.square(), dim=1, keepdim=True)
+        if self.backend in {"rwmu", "rwm-u", "rwm_u"}:
+            rewards, learned_dones, aleatoric, epistemic = self._rwmu_step(env_actions)
+        else:
+            self._actor_state = torch.roll(self._actor_state, shifts=-self.action_dim, dims=1)
+            copy_dim = min(self.action_dim, self.actor_obs_dim)
+            self._actor_state[:, -copy_dim:] = env_actions[:, :copy_dim]
+            self._critic_state[:, : self.actor_obs_dim] = self._actor_state
+            rewards = -self.reward_scale * torch.mean(env_actions.square(), dim=1, keepdim=True)
+            learned_dones = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            aleatoric = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+            epistemic = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         if self.num_critics == 1:
             rewards_out = rewards.squeeze(-1)
         else:
             rewards_out = rewards.repeat(1, self.num_critics)
 
         time_outs = self.episode_length_buf >= self.max_episode_length
-        dones = time_outs.to(dtype=torch.long)
+        dones_bool = learned_dones | time_outs
+        dones = dones_bool.to(dtype=torch.long)
         reset_ids = time_outs.nonzero(as_tuple=False).flatten()
         if reset_ids.numel() > 0:
             self.episode_length_buf[reset_ids] = 0
             self._actor_state[reset_ids] = 0.0
             self._critic_state[reset_ids] = 0.0
             self._last_actions[reset_ids] = 0.0
+            if self._rwmu_state_norm is not None:
+                self._rwmu_state_norm[reset_ids] = 0.0
+            if self._rwmu_state_history is not None:
+                self._rwmu_state_history[reset_ids] = 0.0
+            if self._rwmu_action_history is not None:
+                self._rwmu_action_history[reset_ids] = 0.0
 
         infos = {
             "episode": {
-                "rwm_smoke_reward": rewards.mean().detach(),
-                "rwm_smoke_action_rate": torch.mean(action_delta.square()).detach(),
+                "rwm_reward": rewards.mean().detach(),
+                "rwm_action_rate": torch.mean(action_delta.square()).detach(),
+                "rwm_aleatoric": aleatoric.mean().detach(),
+                "rwm_epistemic": epistemic.mean().detach(),
             },
             "to_log": {
-                "rwm/smoke_reward": rewards.mean().detach(),
-                "rwm/smoke_action_rate": torch.mean(action_delta.square()).detach(),
+                "rwm/reward": rewards.mean().detach(),
+                "rwm/action_rate": torch.mean(action_delta.square()).detach(),
+                "rwm/aleatoric": aleatoric.mean().detach(),
+                "rwm/epistemic": epistemic.mean().detach(),
             },
             "time_outs": time_outs,
         }
@@ -284,6 +411,7 @@ class RwmSonicEnvWrapper:
             "sim_type": "rwm",
             "backend": self.backend,
             "episode_length_buf": self.episode_length_buf.detach().cpu(),
+            "rwmu_state_norm": self._rwmu_state_norm.detach().cpu() if self._rwmu_state_norm is not None else None,
         }
 
     def load_env_state_dict(self, state_dict: dict[str, Any] | None):
@@ -292,6 +420,11 @@ class RwmSonicEnvWrapper:
         episode_length_buf = state_dict.get("episode_length_buf")
         if episode_length_buf is not None:
             self.episode_length_buf[:] = episode_length_buf.to(self.device)
+        rwmu_state_norm = state_dict.get("rwmu_state_norm")
+        if rwmu_state_norm is not None and self._rwmu_state_norm is not None:
+            self._rwmu_state_norm[:] = rwmu_state_norm.to(self.device)
+            self._rwmu_state_history[:, -1] = self._rwmu_state_norm
+            self._sync_obs_from_rwmu_state()
 
     def close(self):
         return None

@@ -71,6 +71,17 @@ def _extract_robot_state(env) -> dict[str, torch.Tensor]:
                 tensor = _safe_tensor(getattr(data, name, None))
                 if tensor is not None:
                     state[name] = tensor
+            try:
+                contact_sensor = candidate.scene["contact_forces"]
+                contact_data = contact_sensor.data
+                for name in ("net_forces_w", "force_matrix_w"):
+                    tensor = _safe_tensor(getattr(contact_data, name, None))
+                    if tensor is not None:
+                        state[f"contact_forces_{name}"] = tensor
+                if hasattr(contact_sensor, "body_names"):
+                    state["contact_body_names"] = list(contact_sensor.body_names)
+            except Exception:
+                pass
             if state:
                 if hasattr(robot, "joint_names"):
                     state["joint_names"] = list(robot.joint_names)

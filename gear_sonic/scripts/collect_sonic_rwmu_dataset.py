@@ -214,7 +214,14 @@ def _build_rwmu_groups(payload: dict[str, Any]) -> dict[str, Any]:
     elif rewards.dim() > 3:
         rewards = rewards.reshape(steps, num_envs, -1)
     extension = rewards[..., :1]
-    contact = torch.zeros(steps, num_envs, 0, dtype=torch.float32)
+    contact_terms = []
+    contact_force = robot_state.get("contact_forces_net_forces_w")
+    if isinstance(contact_force, torch.Tensor):
+        force = contact_force.reshape(steps, num_envs, -1, 3).float()
+        contact = (torch.linalg.norm(force, dim=-1) > 1.0).float()
+        contact_terms.append({"name": "contact_forces", "source": "robot_state.contact_forces_net_forces_w", "dim": contact.shape[-1]})
+    else:
+        contact = torch.zeros(steps, num_envs, 0, dtype=torch.float32)
     termination = (payload["dones"].bool() & ~payload["time_outs"].bool()).float()
     if termination.dim() == 2:
         termination = termination.unsqueeze(-1)
@@ -231,7 +238,7 @@ def _build_rwmu_groups(payload: dict[str, Any]) -> dict[str, Any]:
             "state_terms": state_terms,
             "action_terms": [{"name": "policy_action", "dim": action.shape[-1]}],
             "extension_terms": [{"name": "reward_total", "dim": extension.shape[-1]}],
-            "contact_terms": [],
+            "contact_terms": contact_terms,
             "termination_terms": [{"name": "done_excluding_timeout", "dim": termination.shape[-1]}],
         },
     }

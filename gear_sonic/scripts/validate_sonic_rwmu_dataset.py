@@ -47,6 +47,15 @@ def validate(path: Path) -> dict[str, Any]:
     if rwm["action"].shape[-1] != payload["actions"].reshape(steps, num_envs, -1).shape[-1]:
         raise ValueError("rwm_u.action dim does not match raw actions")
 
+    state_terms = rwm["schema"].get("state_terms", [])
+    missing_fallback_terms = [
+        term for term in state_terms if str(term.get("source", "")).startswith("missing_zero_fallback:")
+    ]
+    if getattr(validate, "require_physical_state", False) and missing_fallback_terms:
+        raise ValueError(f"dataset has missing physical state fallback terms: {missing_fallback_terms}")
+    if getattr(validate, "require_contact", False) and rwm["contact"].shape[-1] == 0:
+        raise ValueError("dataset has no contact labels")
+
     summary = {
         "path": str(path),
         "format": payload["format"],
@@ -60,7 +69,9 @@ def validate(path: Path) -> dict[str, Any]:
         "contact_shape": _shape(rwm["contact"]),
         "termination_shape": _shape(rwm["termination"]),
         "state_source": rwm["schema"].get("state_source"),
-        "state_terms": rwm["schema"].get("state_terms", []),
+        "state_terms": state_terms,
+        "missing_fallback_terms": missing_fallback_terms,
+        "contact_terms": rwm["schema"].get("contact_terms", []),
     }
     return summary
 
@@ -69,7 +80,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--require-physical-state", action="store_true")
+    parser.add_argument("--require-contact", action="store_true")
     args = parser.parse_args()
+    validate.require_physical_state = args.require_physical_state
+    validate.require_contact = args.require_contact
     summary = validate(args.dataset)
     if args.json:
         print(json.dumps(summary, indent=2))

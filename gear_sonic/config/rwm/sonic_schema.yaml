@@ -130,6 +130,7 @@ rwm_u_dynamics_schema:
     - {name: reward_total, source: env.step.reward, dim: 1}
     - {name: reward_terms_optional, source: infos.to_log or reward manager terms, dim: variable}
   contact_terms:
+    - {name: contact_forces, source: robot_state.contact_forces_net_forces_w, dim: contact_sensor_body_count, threshold_newton: 1.0}
     - {name: contact_flags_optional, source: contact sensors when configured, dim: variable}
   termination_terms:
     - {name: done_excluding_timeout, source: dones AND NOT time_outs, dim: 1}

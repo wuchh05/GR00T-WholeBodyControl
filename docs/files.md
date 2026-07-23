@@ -20,8 +20,8 @@ are easy to miss in the larger SONIC tree.
 - `gear_sonic/config/rwm/sonic_schema.yaml` - structured schema for exporting
   SONIC transitions into RWM-U groups.
 - `gear_sonic/envs/rwm_env.py` - SONIC trainer-compatible RWM/RWM-U environment
-  wrapper. Current implemented backend is `smoke`; real RWM-U checkpoint loading
-  should be implemented behind this same wrapper.
+  wrapper. It supports `backend=smoke` for plumbing and `backend=rwmu` for
+  loading SONIC RWM-U dynamics checkpoints produced by the local training script.
 - `gear_sonic/scripts/validate_rwm_config_parity.py` - Hydra config check that
   compares original SONIC release config against `exp=rwm/sonic_release` and
   verifies actor/critic/trainer/MDP config parity.

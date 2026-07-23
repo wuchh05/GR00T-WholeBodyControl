@@ -1,16 +1,21 @@
 # RWM-U Training Setup
 
-This repo uses the stable engineering path: keep SONIC/Isaac and RWM-U training
-in separate conda environments. Do not install `rsl_rl_rwm` in the SONIC/Isaac
-environment. RWM-U weights should later be exported as an inference-only artifact
-and loaded by `gear_sonic/envs/rwm_env.py` without importing `rsl_rl_rwm`.
+This repo uses the stable engineering path: keep heavy RWM-U training separate
+from SONIC/Isaac when scaling up. For the current integration smoke,
+`rwm_env.backend=rwmu` directly imports `rsl_rl_rwm` to load the local dynamics
+checkpoint. For production fine-tuning, prefer exporting the trained RWM-U model
+as an inference-only artifact and loading that artifact from SONIC/Isaac.
 
 Current status:
 
 - Upstream RWM-U bundled-data smoke training runs.
 - SONIC `+exp=rwm/sonic_release` smoke runs without Isaac using placeholder dynamics.
-- A real SONIC-trained `rwm_env.backend=rwmu` checkpoint loader is not implemented yet.
-- Policy rollout export supports RWM smoke, mjlab, and Isaac AppLauncher startup; real Isaac export must be run inside an Isaac Lab environment.
+- `rwm_env.backend=rwmu` now loads SONIC RWM-U dynamics checkpoints produced by
+  `train_sonic_rwmu_dynamics.py`; this is an integration loader, not yet a
+  quality-guaranteed simulator.
+- Policy rollout export supports RWM smoke, mjlab, and Isaac AppLauncher startup;
+  real Isaac export must be run inside an Isaac Lab environment and pass strict
+  physical-field validation.
 
 ## 1. Clone
 
@@ -128,8 +133,9 @@ The intended stable path is:
 4. In `sonic-isaac`, load that artifact from `gear_sonic/envs/rwm_env.py` and run
    SONIC PPO with `+exp=rwm/sonic_release rwm_env.backend=rwmu`.
 
-Step 4 is the missing implementation piece. Until it is added, use the commands
-above for installation, smoke testing, and field validation.
+Step 4 is now wired for smoke/integration testing. The remaining research gate is
+model quality: train on real SONIC/Isaac rollouts, validate holdout n-step error,
+and only then use the backend for meaningful fine-tuning.
 
 
 ## 6. SONIC Policy Rollout Export And Dynamics Smoke
@@ -179,3 +185,105 @@ For real SONIC RWM training, run the same exporter with
 The smoke dataset reports `missing_zero_fallback:*` state terms because the RWM
 placeholder has no physical robot state; do not use smoke data for model quality
 claims.
+
+
+## 7. Current End-To-End Smoke Result
+
+The following smoke chain has been verified locally with 12 steps and 2 parallel
+environments:
+
+```bash
+python gear_sonic/scripts/collect_sonic_rwmu_dataset.py \
+  --output /tmp/sonic_rwmu_12.pt \
+  --steps 12 \
+  --device cuda \
+  --action-source policy \
+  --checkpoint sonic_release/last.pt \
+  -- +exp=rwm/sonic_release num_envs=2 headless=True use_wandb=false
+
+python gear_sonic/scripts/collect_sonic_rwmu_dataset.py \
+  --output /tmp/sonic_rwmu_12_random.pt \
+  --steps 12 \
+  --device cuda \
+  --action-source random \
+  -- +exp=rwm/sonic_release num_envs=2 headless=True use_wandb=false
+
+python gear_sonic/scripts/validate_sonic_rwmu_dataset.py /tmp/sonic_rwmu_12.pt --json
+
+python gear_sonic/scripts/train_sonic_rwmu_dynamics.py \
+  --dataset /tmp/sonic_rwmu_12.pt \
+  --dataset /tmp/sonic_rwmu_12_random.pt \
+  --output /tmp/sonic_rwmu_dynamics_12.pt \
+  --report /tmp/sonic_rwmu_dynamics_12_report.json \
+  --device cuda \
+  --history-horizon 6 \
+  --forecast-horizon 2 \
+  --ensemble-size 2 \
+  --hidden-size 64 \
+  --batch-size 4 \
+  --epochs 1
+
+python gear_sonic/train_agent_trl.py \
+  +exp=rwm/sonic_release \
+  +checkpoint=sonic_release/last.pt \
+  num_envs=2 headless=True \
+  rwm_env.backend=rwmu \
+  +rwm_env.checkpoint=/tmp/sonic_rwmu_dynamics_12.pt \
+  algo.config.num_steps_per_env=2 \
+  algo.config.num_learning_iterations=1 \
+  algo.config.num_learning_epochs=1 \
+  algo.config.num_mini_batches=1 \
+  use_wandb=false
+```
+
+The final training smoke logged `Env/rwm/reward`, `Env/rwm/aleatoric`, and
+`Env/rwm/epistemic`, confirming that policy training used the loaded RWM-U
+checkpoint path rather than the placeholder smoke reward.
+
+The same smoke dataset intentionally fails strict physical-state validation:
+
+```bash
+python gear_sonic/scripts/validate_sonic_rwmu_dataset.py \
+  /tmp/sonic_rwmu_12.pt --require-physical-state
+```
+
+That failure is expected because `+exp=rwm/sonic_release` has no Isaac robot
+state and therefore uses `missing_zero_fallback:*` state terms. Real Isaac data
+must pass:
+
+```bash
+python gear_sonic/scripts/validate_sonic_rwmu_dataset.py \
+  /path/to/sonic_isaac_dataset.pt \
+  --require-physical-state
+```
+
+Add `--require-contact` once contact labels are mandatory for the selected RWM-U
+training target.
+
+A real Isaac collection attempt reached Isaac AppLauncher, loaded the G1 assets,
+and started loading `data/motion_lib_bones_seed/robot_filtered` with 129785
+motions, but was manually stopped before rollout write-out because first startup
+was taking several minutes. For the next real run, use a smaller motion subset or
+prebuild the motion cache before collecting RWM-U data.
+
+## 8. Sampling Strategy For Real RWM-U Data
+
+Do not copy the original SONIC PPO sampling distribution exactly. PPO mostly
+samples on-policy states for improving the current policy, while RWM-U needs to
+cover states that future policy optimization may visit after the simulator is
+replaced.
+
+Recommended initial mixture:
+
+- Released policy, deterministic action mean: stable nominal tracking manifold.
+- Released policy, stochastic actions: local action perturbations around the
+  nominal manifold.
+- Random/noisy actions with short horizons: dynamics sensitivity and recovery
+  labels, but cap episode length to avoid wasting data far outside useful states.
+- Multiple fine-tuned or intermediate checkpoints: policy-distribution diversity.
+- Failure-heavy clips and difficult motion bins: termination boundary coverage.
+- Held-out motion IDs and start phases: n-step validation without train leakage.
+
+Keep separate train/validation splits by motion ID and policy checkpoint. If the
+same motion and same policy appears in both splits, n-step error will be overly
+optimistic.
