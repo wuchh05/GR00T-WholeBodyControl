@@ -287,3 +287,92 @@ Recommended initial mixture:
 Keep separate train/validation splits by motion ID and policy checkpoint. If the
 same motion and same policy appears in both splits, n-step error will be overly
 optimistic.
+
+
+## 9. Managed First-Pass Isaac Sampling
+
+Use a manifest rather than sampling the entire motion tree directly. The manifest
+records selected motions, unselected candidates, train/val split labels, and the
+materialized subset directories used by the collector.
+
+Create a small first-pass subset:
+
+```bash
+python gear_sonic/scripts/prepare_sonic_rwmu_sampling_manifest.py \
+  --robot-motion-root data/motion_lib_bones_seed/robot_filtered \
+  --smpl-motion-root data/smpl_filtered \
+  --output-root data/rwmu_sampling/v1_small \
+  --output data/rwmu_sampling/v1_small/manifest.json \
+  --name v1_small \
+  --max-per-category 2 \
+  --materialize symlink
+```
+
+The default categories are intentionally broad and small:
+
+```text
+nominal_walk, turning, jog, jump, balance_idle, hard_lower_body
+```
+
+The local smoke run used `--max-per-category 1` and selected 6 motions. This is
+not enough for training quality, but it is enough to verify directory layout,
+manifest bookkeeping, and command generation.
+
+Dry-run the real Isaac collection plan before starting expensive jobs:
+
+```bash
+python gear_sonic/scripts/run_sonic_rwmu_sampling_plan.py \
+  --manifest data/rwmu_sampling/v1_small/manifest.json \
+  --output-dir /mnt/datasets/sonic_rwmu/v1_small/raw \
+  --ledger /mnt/datasets/sonic_rwmu/v1_small/ledger.json \
+  --policy sonic_release/last.pt \
+  --action-source policy_mean \
+  --action-source policy_stochastic \
+  --action-source random \
+  --sim-preset isaac \
+  --steps 512 \
+  --num-envs 128 \
+  --device cuda \
+  --require-physical-state \
+  --dry-run
+```
+
+Run the same command without `--dry-run` on the compute machine. The runner writes
+a ledger after every task, so interrupted jobs still show which datasets finished
+and which failed. Each output dataset is validated immediately.
+
+For a local no-Isaac plumbing check, use the smoke preset:
+
+```bash
+python gear_sonic/scripts/run_sonic_rwmu_sampling_plan.py \
+  --manifest /tmp/sonic_rwmu_sampling_v1_small/manifest.json \
+  --output-dir /tmp/sonic_rwmu_sampling_v1_small/out_smoke \
+  --ledger /tmp/sonic_rwmu_sampling_v1_small/ledger_smoke.json \
+  --policy sonic_release/last.pt \
+  --action-source policy_mean \
+  --action-source random \
+  --sim-preset rwm-smoke \
+  --steps 8 \
+  --num-envs 2 \
+  --device cuda
+```
+
+This smoke path has been verified locally and produced two valid datasets plus a
+ledger with `ok=2`. It still uses `missing_zero_fallback:*` state terms and must
+not be used for RWM-U quality training.
+
+### First-Pass Collection Recommendation
+
+For the first useful Isaac dataset, keep the run modest but diverse:
+
+- 12 to 24 selected motions from the manifest categories.
+- 3 action sources: `policy_mean`, `policy_stochastic`, and short-horizon
+  `random`.
+- 1 to 3 policy checkpoints initially; add intermediate fine-tuned checkpoints
+  later.
+- `num_envs=128` and `steps=512` per task as a first scalable check, then expand.
+- Require `--require-physical-state`; add `--require-contact` only after contact
+  labels are confirmed non-empty for the selected task.
+
+Use separate manifests or split labels for train and validation. Do not evaluate
+n-step error on the same motion-policy pairs used for training.

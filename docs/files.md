@@ -41,5 +41,11 @@ are easy to miss in the larger SONIC tree.
 - `gear_sonic/scripts/collect_sonic_rwmu_dataset.py` - collects SONIC rollouts
   from one or more policy checkpoints and exports raw transitions plus RWM-U
   `state/action/extension/contact/termination` tensors.
+- `gear_sonic/scripts/prepare_sonic_rwmu_sampling_manifest.py` - builds a small,
+  managed motion subset directory and JSON manifest for first-pass RWM-U data
+  collection.
+- `gear_sonic/scripts/run_sonic_rwmu_sampling_plan.py` - runs batch rollout
+  collection tasks from a manifest and records a ledger of outputs, commands,
+  validation results, and failures.
 - `external_dependencies/robotic_world_model/` - upstream ETH RWM/RWM-U codebase
   cloned for reference and later checkpoint/model integration.
