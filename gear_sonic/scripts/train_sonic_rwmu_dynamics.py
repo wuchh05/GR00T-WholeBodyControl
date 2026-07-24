@@ -86,8 +86,8 @@ def _make_physx_series(state: torch.Tensor, next_state: torch.Tensor, action: to
     # state/action layout expected by upstream RWM-U. The final action is a pad
     # value and is never used as an input for a real logged transition.
     state_series = torch.cat([state, next_state[-1:].clone()], dim=0)
-    action_pad = torch.zeros_like(action[-1:])
-    action_series = torch.cat([action, action_pad], dim=0)
+    action_pad = torch.zeros_like(action[:1])
+    action_series = torch.cat([action_pad, action], dim=0)
     return state_series, action_series
 
 
