@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import select
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -37,17 +40,97 @@ def _split_overrides(value: str | None) -> list[str]:
     return shlex.split(value) if value else []
 
 
-def _run(cmd: list[str], dry_run: bool) -> dict[str, Any]:
+def _terminate_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        proc.wait(timeout=10)
+
+
+def _run(
+    cmd: list[str],
+    dry_run: bool,
+    *,
+    timeout_seconds: float = 0.0,
+    success_marker: str | None = None,
+    success_grace_seconds: float = 10.0,
+) -> dict[str, Any]:
     start = time.time()
     if dry_run:
         return {"returncode": 0, "seconds": 0.0, "stdout_tail": "", "stderr_tail": "", "dry_run": True}
-    proc = subprocess.run(cmd, cwd=_REPO_ROOT, text=True, capture_output=True)
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("SONIC_RWMU_DEBUG", "1")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=_REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        start_new_session=True,
+        env=env,
+    )
+    tail_lines: list[str] = []
+    marker_seen_at: float | None = None
+    timed_out = False
+    marker_terminated = False
+
+    assert proc.stdout is not None
+    while True:
+        if proc.poll() is not None:
+            for line in proc.stdout.readlines():
+                print(line, end="", flush=True)
+                tail_lines.append(line)
+            break
+
+        ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+        if ready:
+            line = proc.stdout.readline()
+            if line:
+                print(line, end="", flush=True)
+                tail_lines.append(line)
+                if len(tail_lines) > 200:
+                    tail_lines = tail_lines[-200:]
+                if success_marker and success_marker in line:
+                    marker_seen_at = time.time()
+
+        elapsed = time.time() - start
+        if timeout_seconds > 0 and elapsed > timeout_seconds:
+            timed_out = True
+            print(f"[timeout] command exceeded {timeout_seconds:.1f}s; terminating", flush=True)
+            _terminate_process(proc)
+            break
+        if marker_seen_at is not None and time.time() - marker_seen_at > success_grace_seconds:
+            marker_terminated = True
+            print(
+                f"[marker] saw {success_marker!r}; terminating child after "
+                f"{success_grace_seconds:.1f}s close grace",
+                flush=True,
+            )
+            _terminate_process(proc)
+            break
+
     return {
-        "returncode": proc.returncode,
+        "returncode": proc.returncode if proc.returncode is not None else -signal.SIGTERM,
         "seconds": round(time.time() - start, 3),
-        "stdout_tail": proc.stdout[-4000:],
-        "stderr_tail": proc.stderr[-4000:],
+        "stdout_tail": "".join(tail_lines)[-8000:],
+        "stderr_tail": "",
         "dry_run": False,
+        "timed_out": timed_out,
+        "success_marker_seen": marker_seen_at is not None,
+        "terminated_after_success_marker": marker_terminated,
     }
 
 
@@ -138,21 +221,31 @@ def run_plan(args: argparse.Namespace) -> dict[str, Any]:
             cmd.append("--deterministic-policy-action")
         cmd.append("--")
         cmd.extend(base_overrides)
-        entry: dict[str, Any] = {"index": idx, "output": str(out), "task": task, "collect_cmd": cmd}
-        collect_result = _run(cmd, args.dry_run)
+        entry: dict[str, Any] = {"index": idx, "output": str(out), "task": task, "collect_cmd": cmd, "status": "running"}
+        ledger["tasks"].append(entry)
+        args.ledger.parent.mkdir(parents=True, exist_ok=True)
+        args.ledger.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
+        print(f"[running] {out}", flush=True)
+        collect_result = _run(
+            cmd,
+            args.dry_run,
+            timeout_seconds=args.collect_timeout_seconds,
+            success_marker="[sonic-rwmu-export] save done" if args.fast_exit_after_save else None,
+            success_grace_seconds=args.fast_exit_grace_seconds,
+        )
         entry["collect"] = collect_result
-        if collect_result["returncode"] == 0 and not args.dry_run:
+        collect_ok = collect_result["returncode"] == 0 or (collect_result.get("success_marker_seen") and out.exists())
+        if collect_ok and not args.dry_run:
             val_cmd = [sys.executable, str(_VALIDATE), str(out), "--json"]
             if args.require_physical_state:
                 val_cmd.append("--require-physical-state")
             if args.require_contact:
                 val_cmd.append("--require-contact")
             entry["validate_cmd"] = val_cmd
-            entry["validate"] = _run(val_cmd, False)
+            entry["validate"] = _run(val_cmd, False, timeout_seconds=args.validate_timeout_seconds)
             entry["status"] = "ok" if entry["validate"]["returncode"] == 0 else "validate_failed"
         else:
             entry["status"] = "dry_run" if args.dry_run else "collect_failed"
-        ledger["tasks"].append(entry)
         args.ledger.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
         print(f"[{entry['status']}] {out}")
 
@@ -187,6 +280,10 @@ def main() -> None:
     parser.add_argument("--extra-overrides", default=None)
     parser.add_argument("--require-physical-state", action="store_true")
     parser.add_argument("--require-contact", action="store_true")
+    parser.add_argument("--collect-timeout-seconds", type=float, default=0.0, help="Per collect task timeout. 0 disables timeout.")
+    parser.add_argument("--validate-timeout-seconds", type=float, default=300.0, help="Per validation task timeout.")
+    parser.add_argument("--fast-exit-after-save", action=argparse.BooleanOptionalAction, default=True, help="If the collector prints save done but Isaac shutdown hangs, terminate the child after a short grace period and validate the saved dataset.")
+    parser.add_argument("--fast-exit-grace-seconds", type=float, default=10.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if not args.action_source:
